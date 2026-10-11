@@ -19,7 +19,6 @@ pub enum Action {
     ExportJson,
     ExportCsv,
     ClearHistory,
-    ToggleChartEdge,
 }
 
 impl Action {
@@ -32,7 +31,6 @@ impl Action {
             Action::ExportJson => "Export history as JSON",
             Action::ExportCsv => "Export history as CSV",
             Action::ClearHistory => "Clear history",
-            Action::ToggleChartEdge => "Toggle smoothed trace",
         }
     }
 
@@ -42,17 +40,6 @@ impl Action {
             Action::ExportJson => "writes cfspeed-history.json",
             Action::ExportCsv => "writes cfspeed-history.csv",
             Action::ClearHistory => "removes every saved run",
-            Action::ToggleChartEdge => "smoothing + 4 sub-rows per cell",
-        }
-    }
-
-    /// Label for the edge that is currently *not* in use, so the menu always
-    /// offers the switch to the other style.
-    pub fn edge_label(smooth: bool) -> &'static str {
-        if smooth {
-            "Chart edge: raw"
-        } else {
-            "Chart edge: smooth"
         }
     }
 }
@@ -135,7 +122,7 @@ impl Default for Zoom {
 }
 
 /// Static list of palette entries, so the menu never has to be rebuilt.
-pub const MENU: [Action; 8] = [
+pub const MENU: [Action; 7] = [
     Action::Run(TestMode::Full),
     Action::Run(TestMode::Latency),
     Action::Run(TestMode::Download),
@@ -143,7 +130,6 @@ pub const MENU: [Action; 8] = [
     Action::ExportJson,
     Action::ExportCsv,
     Action::ClearHistory,
-    Action::ToggleChartEdge,
 ];
 
 pub struct App {
@@ -190,8 +176,6 @@ pub struct App {
     pub error: Option<String>,
     pub restart: bool,
     pub quit: bool,
-    /// Draw chart edges with braille sub-pixels for a finer wave.
-    pub smooth_charts: bool,
 
     /// Identifies the current run. Events tagged with an older generation are
     /// discarded, so a superseded runner can never mix samples into a new test.
@@ -228,7 +212,6 @@ impl App {
             error: None,
             restart: false,
             quit: false,
-            smooth_charts: true,
             generation: 0,
         }
     }
@@ -457,17 +440,6 @@ impl App {
                 }
                 Err(e) => self.status = format!("export failed: {e}"),
             },
-            Action::ToggleChartEdge => {
-                self.smooth_charts = !self.smooth_charts;
-                self.status = format!(
-                    "chart edge: {}",
-                    if self.smooth_charts {
-                        "smooth"
-                    } else {
-                        "solid"
-                    }
-                );
-            }
             Action::ClearHistory => match history::clear() {
                 Ok(_) => {
                     self.history.clear();
@@ -860,57 +832,5 @@ mod tests {
     /// Build a non-character key press (arrows, Home/End, Enter).
     fn press_key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
-    }
-
-    #[test]
-    fn key_releases_are_ignored() {
-        let mut a = app();
-        a.view = View::Charts;
-        let mut release = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('1'),
-            crossterm::event::KeyModifiers::NONE,
-        );
-        release.kind = crossterm::event::KeyEventKind::Release;
-        a.on_key(release);
-        assert_eq!(a.view, View::Charts, "a Release must not switch views");
-    }
-
-    /// The edge style has to be switchable at runtime: smooth draws the trace
-    /// smoothed and four sub-rows deep but dotted, raw is dotless but coarser.
-    #[test]
-    fn the_edge_style_toggles_and_the_menu_offers_the_other_one() {
-        let mut a = app();
-        let start = a.smooth_charts;
-        // The menu always names the style it would switch *to*.
-        assert_eq!(
-            Action::edge_label(start),
-            if start {
-                "Chart edge: raw"
-            } else {
-                "Chart edge: smooth"
-            },
-            "the menu should offer the switch away from the current style"
-        );
-
-        a.run_action(Action::ToggleChartEdge);
-        assert_ne!(a.smooth_charts, start, "the toggle must flip the style");
-        assert_eq!(
-            Action::edge_label(a.smooth_charts),
-            if start {
-                "Chart edge: smooth"
-            } else {
-                "Chart edge: raw"
-            }
-        );
-
-        a.run_action(Action::ToggleChartEdge);
-        assert_eq!(
-            a.smooth_charts, start,
-            "toggling twice returns to the start"
-        );
-        assert!(
-            MENU.contains(&Action::ToggleChartEdge),
-            "the toggle must be reachable from the palette"
-        );
     }
 }

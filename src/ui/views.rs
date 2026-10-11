@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{Action, App, View, MENU, QUICK_ACTIONS};
+use crate::app::{App, View, MENU, QUICK_ACTIONS};
 use crate::speed::{
     bufferbloat_grade, cv_percent, median, percentile, stability_grade, LatencyStats, Phase,
 };
@@ -150,13 +150,7 @@ fn command_palette(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             row.push(Span::raw("  "));
         }
-        // The edge entry names the style it switches *to*, so it has to be
-        // resolved against current state rather than read off the constant.
-        let label = match action {
-            Action::ToggleChartEdge => Action::edge_label(app.smooth_charts),
-            other => other.label(),
-        };
-        row.push(Span::styled(format!("{label:<26}"), style));
+        row.push(Span::styled(format!("{:<26}", action.label()), style));
         row.push(Span::styled(action.hint(), theme::style_label()));
         lines.push(Line::from(row));
     }
@@ -484,7 +478,6 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         app.phase == Phase::Download,
         app.paused,
         span(down.len()),
-        app.smooth_charts,
     );
     phase_column(
         frame,
@@ -497,7 +490,6 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         app.phase == Phase::Upload,
         app.paused,
         span(up.len()),
-        app.smooth_charts,
     );
 }
 
@@ -513,7 +505,6 @@ fn phase_column(
     active: bool,
     paused: bool,
     window_seconds: u64,
-    smooth: bool,
 ) {
     if area.width < 24 || area.height < 8 {
         return;
@@ -597,7 +588,6 @@ fn phase_column(
             x_axis: true,
             unit: "Mbps",
             window_seconds,
-            smooth,
         },
     );
 
@@ -694,7 +684,6 @@ fn charts(frame: &mut Frame, area: Rect, app: &App) {
                 x_axis: true,
                 unit,
                 window_seconds: 0,
-                smooth: app.smooth_charts,
             },
         );
     }
@@ -1094,7 +1083,6 @@ fn history(frame: &mut Frame, area: Rect, app: &App) {
             x_axis: false,
             unit: "Mbps",
             window_seconds: 0,
-            smooth: true,
         },
     );
 }
@@ -1373,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn charts_fill_the_body_solidly_and_confine_dots_to_the_edge() {
+    fn charts_draw_solid_bars_with_no_braille() {
         let mut app = App::new();
         app.view = View::Charts;
         app.down_samples = (0..40).map(|i| (i % 20) as f64 * 6.0).collect();
@@ -1382,34 +1370,22 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).expect("draw");
         let buf = terminal.backend().buffer().clone();
 
-        // Smooth mode draws the wave with braille so the edge has four steps per
-        // cell, but the area under it must still be painted as background
-        // colour. Counting dots alone would miss a body that had gone back to
-        // being a field of dots, which is what this guards against.
-        let reset = ratatui::style::Color::Reset;
-        let (mut solid, mut dotted) = (0usize, 0usize);
+        let mut bars = 0usize;
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                let ch = cell.symbol().chars().next().unwrap_or(' ');
-                // A blank braille cell is body, not ink: only count it as dotted
-                // when it actually carries stroke bits.
-                let inked = ch != '\u{2800}' && ('\u{2800}'..='\u{28FF}').contains(&ch);
-                if inked {
-                    dotted += 1;
-                } else if cell.bg != reset {
-                    solid += 1;
+                let ch = buf[(x, y)].symbol().chars().next().unwrap_or(' ');
+                // No dotted rendering anywhere: braille turns an area chart
+                // into a screen of dots, which is the look being avoided.
+                assert!(
+                    !('\u{2800}'..='\u{28FF}').contains(&ch),
+                    "braille dot at {x},{y}: the chart must draw solid blocks"
+                );
+                if ch == '\u{2588}' {
+                    bars += 1;
                 }
             }
         }
-        assert!(
-            solid > 200,
-            "the chart body must be painted with background colour, got {solid} solid cells"
-        );
-        assert!(
-            dotted < solid / 2,
-            "dots should only trace the edge ({dotted} dotted vs {solid} solid cells)"
-        );
+        assert!(bars > 50, "expected bars, drew only {bars} blocks");
     }
     #[test]
     fn details_view_renders_all_group_headings() {

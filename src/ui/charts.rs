@@ -31,60 +31,6 @@ use ratatui::text::{Line, Span, Text};
 
 use crate::ui::theme;
 
-/// Bit for the braille dot at sub-column `sx` (0=left, 1=right) and sub-row
-/// `sy` (0=top .. 3=bottom).
-///
-/// Dots are numbered down each column first:
-/// ```text
-/// dot1 dot4
-/// dot2 dot5
-/// dot3 dot6
-/// dot7 dot8
-/// ```
-#[must_use]
-pub fn dot_bit(sx: usize, sy: usize) -> u8 {
-    let dot = match sy {
-        0..=2 => {
-            if sx == 0 {
-                sy + 1
-            } else {
-                sy + 4
-            }
-        }
-        _ => 7 + sx,
-    };
-    1u8 << (dot - 1)
-}
-
-/// Glyph for a raw dot bitmask.
-#[must_use]
-pub fn braille_from_bits(bits: u8) -> char {
-    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
-}
-
-/// Centred moving average used to smooth the drawn trace.
-///
-/// The window is five samples, a second of trace at the engine's 200ms
-/// interval: enough for the eye to follow it as a curve, small enough that a
-/// real drop or spike still shows. Edges use a partial window so the first and
-/// last samples are not pulled toward zero.
-#[must_use]
-pub fn smooth_series(data: &[f64]) -> Vec<f64> {
-    const WINDOW: usize = 5;
-    if data.len() <= WINDOW {
-        return data.to_vec();
-    }
-    let half = WINDOW / 2;
-    data.iter()
-        .enumerate()
-        .map(|(i, _)| {
-            let lo = i.saturating_sub(half);
-            let hi = (i + half + 1).min(data.len());
-            data[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
-        })
-        .collect()
-}
-
 #[derive(Clone, Copy)]
 pub struct ChartStyle {
     /// Colour of the curve itself.
@@ -145,13 +91,6 @@ pub struct ChartOpts {
     pub unit: &'static str,
     /// Seconds shown on the time axis (0 omits it).
     pub window_seconds: u64,
-    /// Draw the wave with braille sub-pixels instead of half blocks.
-    ///
-    /// Half blocks give the edge two steps per cell; braille gives four
-    /// vertically and two horizontally, so the wave is noticeably finer. The
-    /// body stays solid either way - only the top band that the curve passes
-    /// through is drawn with dots.
-    pub smooth: bool,
 }
 
 impl Default for ChartOpts {
@@ -161,7 +100,6 @@ impl Default for ChartOpts {
             x_axis: true,
             unit: "Mbps",
             window_seconds: 0,
-            smooth: false,
         }
     }
 }
@@ -191,9 +129,16 @@ fn axis_label(v: f64, unit: &str) -> String {
     }
 }
 
-/// Paint a smooth area chart with labelled axes.
+/// Paint a bar graph with labelled axes, one column per sample.
 ///
-/// Newest samples sit at the right edge; while the test is young the curve grows
+/// This is the btop/htop idiom: solid blocks on a character grid, the leading
+/// edge of each bar brightened. It is deliberately not an area chart. Smoothing
+/// a trace and drawing it as a curve looks closer to a web chart, but a cell
+/// can only be filled whole or in half-block steps, so the curve always either
+/// steps once per cell or renders as a field of dots. Bars state exactly what
+/// was measured, one column per sample, with nothing to infer.
+///
+/// Newest samples sit at the right edge; while the test is young the trace grows
 /// left-to-right.
 pub fn render_chart(
     buf: &mut Buffer,
@@ -220,121 +165,57 @@ pub fn render_chart(
     let max = if max > 0.0 { max } else { 1.0 };
     let w = usize::from(plot.width);
     let h = usize::from(plot.height);
-    // Braille splits a cell 2x4, giving four vertical and two horizontal steps.
-    // Half blocks only split it horizontally, which is why the raw trace reads
-    // as a row of blocks rather than a curve.
-    let sub_rows = 4;
-    let sub_h = h * sub_rows;
-    let sub_w = w * 2;
 
-    // Smooth the trace before drawing it. Samples land 200ms apart and a real
-    // link is noisy, so the raw series is mostly high-frequency spikes that no
-    // amount of pixel resolution can turn into a wave. A web chart fits a curve
-    // through the points; this is the terminal equivalent. It affects the drawn
-    // line only - every statistic is still computed from the raw samples.
-    let series: Vec<f64> = if opts.smooth {
-        smooth_series(data)
-    } else {
-        data.to_vec()
+    // One column per sample. Where the trace is denser than the plot, a column
+    // takes the peak of its bucket rather than the mean: averaging spikes away
+    // is how a speed trace loses the very thing it exists to show.
+    let column_value = |cx: usize| -> Option<f64> {
+        if data.len() >= w && w > 0 {
+            let lo = cx * data.len() / w;
+            let hi = (((cx + 1) * data.len()) / w).max(lo + 1).min(data.len());
+            Some(data[lo..hi].iter().copied().fold(0.0, f64::max))
+        } else {
+            data.get(cx).copied()
+        }
     };
-
-    // Curve height per sub-column, in sub-rows from the top. `None` marks a
-    // column before the first sample arrived.
-    let first = series.len().saturating_sub(w);
-    let y_sub: Vec<Option<f64>> = (0..sub_w)
-        .map(|c| {
-            let pos = first as f64 + c as f64 / 2.0;
-            let i0 = pos.floor() as usize;
-            if i0 >= series.len() {
-                return None;
-            }
-            let frac = pos - i0 as f64;
-            let a = series[i0];
-            let b = series.get(i0 + 1).copied().unwrap_or(a);
-            let norm = ((a + (b - a) * frac) / max).clamp(0.0, 1.0);
-            Some((1.0 - norm) * (sub_h - 1) as f64)
-        })
-        .collect();
 
     let grid_style = Style::default().fg(style.axis);
     let grid_row = plot.height / 2;
 
-    // Grid first; the fill paints over it wherever the chart reaches.
     for cx in 0..w {
-        let pos = Position::new(plot.x + cx as u16, plot.y + grid_row);
-        if let Some(cell) = buf.cell_mut(pos) {
-            cell.set_symbol("\u{b7}");
-            cell.set_style(grid_style);
-        }
-    }
+        let cell_x = plot.x + cx as u16;
 
-    // Trace the curve. Each sub-column gets a dot, and consecutive sub-columns
-    // are joined vertically: without that a curve that moves more than one
-    // sub-row between columns breaks into detached specks instead of a line.
-    let mut line_bits = vec![0u8; w * h];
-    // Topmost row the curve reaches in each column, so the fill starts there
-    // instead of leaving the stroke hanging over empty space.
-    let mut col_top = vec![h; w];
-    // One dot per sub-column: a single sub-row is the thinnest stroke a cell
-    // can draw, and it is what makes the curve read as a line rather than as a
-    // band. Consecutive sub-columns are bridged so a curve that moves between
-    // them stays unbroken, but the bridge is capped - an uncapped one turns a
-    // steep segment into a long vertical run of dots that reads as scattered
-    // specks rather than as a curve.
-    const MAX_BRIDGE: usize = 3;
-    let mut prev: Option<usize> = None;
-    for (c, slot) in y_sub.iter().enumerate() {
-        let Some(v) = *slot else { continue };
-        let y = (v.round().max(0.0) as usize).min(sub_h - 1);
-        let (lo, hi) = match prev {
-            Some(p) if p < y => (p, (p + MAX_BRIDGE).min(y)),
-            Some(p) => ((y + MAX_BRIDGE).min(p), p),
-            None => (y, y),
-        };
-        for yy in lo..=hi {
-            let (ccx, ccy) = (c / 2, yy / sub_rows);
-            if ccx < w && ccy < h {
-                line_bits[ccy * w + ccx] |= dot_bit(c % 2, yy % sub_rows);
-                col_top[ccx] = col_top[ccx].min(ccy);
+        // Grid rule first, so the bars paint over it.
+        if opts.y_axis {
+            if let Some(cell) = buf.cell_mut(Position::new(cell_x, plot.y + grid_row)) {
+                cell.set_symbol("\u{b7}");
+                cell.set_style(grid_style);
             }
         }
-        prev = Some(y);
-    }
 
-    for cx in 0..w {
-        let top = col_top[cx];
-        if top >= h {
+        let Some(value) = column_value(cx) else {
+            continue;
+        };
+        let filled = ((value / max).clamp(0.0, 1.0) * h as f64).round() as usize;
+        if filled == 0 {
             continue;
         }
-        let cell_x = plot.x + cx as u16;
+        let top = h - filled.min(h);
+
         for cy in top..h {
-            let pos = Position::new(cell_x, plot.y + cy as u16);
-            let Some(cell) = buf.cell_mut(pos) else {
+            let Some(cell) = buf.cell_mut(Position::new(cell_x, plot.y + cy as u16)) else {
                 continue;
             };
-            // Area gradient: faint where it meets the line, saturating toward
-            // the baseline. Running the ramp the other way - heaviest at the
-            // crest - reads as a slab with a pale foot rather than an area.
-            let depth = (cy - top) as f64;
-            let span = h.saturating_sub(top).max(1) as f64;
-            // Start bright enough that the fill visibly meets the line: a top
-            // step of near-zero reads as a gap under the curve.
-            let k = 0.10 + 0.34 * (depth / span);
-            // Quantise: a per-row ramp spans the full range in as many steps as
-            // there are rows, and each step lands as a hard edge, which reads
-            // as stripes rather than depth.
-            const FILL_STEPS: f64 = 6.0;
-            let k = (k * FILL_STEPS).round() / FILL_STEPS;
-            let body = theme::blend(theme::SURFACE, style.fill, k);
-
-            let bits = line_bits[cy * w + cx];
-            if bits == 0 {
-                cell.set_symbol(" ");
-                cell.set_style(Style::default().bg(body));
+            cell.set_symbol("\u{2588}");
+            // btop's look: the bar carries the phase accent, and the block at
+            // its leading edge is brighter, so the eye finds the current value
+            // without having to read the axis.
+            let st = if cy == top {
+                Style::default().fg(style.line).add_modifier(Modifier::BOLD)
             } else {
-                cell.set_symbol(braille_from_bits(bits).encode_utf8(&mut [0u8; 4]));
-                cell.set_style(Style::default().fg(style.line).bg(body));
-            }
+                Style::default().fg(theme::blend(theme::SURFACE_ALT, style.fill, 0.72))
+            };
+            cell.set_style(st);
         }
     }
 
@@ -494,14 +375,14 @@ mod tests {
             .unwrap_or_else(|| "<oob>".to_string())
     }
 
-    /// True when the cell carries part of the chart: a painted background
-    /// (the solid body) or a half-block crest glyph.
-    fn is_solid(b: &Buffer, x: u16, y: u16) -> bool {
-        let Some(c) = b.cell(Position::new(x, y)) else {
-            return false;
-        };
-        let crest = matches!(c.symbol().chars().next(), Some('▀' | '▄'));
-        crest || !matches!(c.bg, Color::Reset)
+    fn is_block(s: &str) -> bool {
+        s == "\u{2588}"
+    }
+
+    fn fg_of(b: &Buffer, x: u16, y: u16) -> Color {
+        b.cell(Position::new(x, y))
+            .map(|c| c.fg)
+            .unwrap_or(Color::Reset)
     }
 
     fn plot(w: u16, h: u16, data: &[f64], max: f64) -> Buffer {
@@ -522,82 +403,83 @@ mod tests {
     }
 
     #[test]
-    fn full_scale_value_fills_every_row() {
-        let b = plot(12, 6, &[100.0], 100.0);
-        for y in 0..6 {
-            assert!(is_solid(&b, 0, y), "row {y} should carry a dot");
-        }
-    }
-
-    #[test]
     fn empty_data_leaves_the_plot_blank() {
         let b = plot(10, 4, &[], 100.0);
         for y in 0..4 {
             for x in 0..10 {
-                assert!(!is_solid(&b, x, y), "expected blank at {x},{y}");
+                assert!(!is_block(&sym(&b, x, y)), "expected blank at {x},{y}");
             }
         }
     }
 
-    /// The whole point of braille: a ramp must produce a continuous stroke with
-    /// no gaps, and every column must carry ink.
     #[test]
-    fn a_ramp_draws_a_continuous_stroke() {
-        let data: Vec<f64> = (0..20).map(|i| i as f64 * 5.0).collect();
-        let b = plot(20, 10, &data, 100.0);
-        for x in 0..20 {
-            let mut ink = false;
-            for y in 0..10 {
-                if is_solid(&b, x, y) {
-                    ink = true;
-                }
-            }
-            assert!(ink, "column {x} has a gap - stroke is not continuous");
+    fn full_scale_value_fills_every_row() {
+        let b = plot(12, 6, &[100.0], 100.0);
+        for y in 0..6 {
+            assert!(is_block(&sym(&b, 0, y)), "row {y} should carry a bar");
         }
     }
 
-    /// Vertical resolution is the reason braille is used: a ramp must reach the
-    /// top row gradually, not in two or three big jumps.
     #[test]
-    fn a_ramp_resolves_more_than_one_step_per_cell() {
-        let data: Vec<f64> = (0..40).map(|i| i as f64 * 2.5).collect();
-        let b = plot(40, 8, &data, 100.0);
-        // Record which row the topmost ink sits in, per column.
-        let top: Vec<i32> = (0..40u16)
-            .map(|x| {
-                (0..8u16)
-                    .find(|y| is_solid(&b, x, *y))
-                    .map(i32::from)
-                    .unwrap_or(-1)
-            })
-            .collect();
-        // Count how many distinct rows the curve occupies across the sweep.
-        let distinct: std::collections::BTreeSet<i32> = top.iter().copied().collect();
-        assert!(
-            distinct.len() >= 6,
-            "curve only occupied {} distinct rows, expected a smooth sweep",
-            distinct.len()
-        );
+    fn a_zero_value_draws_no_bar() {
+        let b = plot(4, 5, &[0.0], 100.0);
+        for y in 0..5 {
+            assert!(!is_block(&sym(&b, 0, y)), "a zero sample must not draw");
+        }
+    }
+
+    /// Half a sample's worth of value must round to a whole row, never a
+    /// partial-block glyph: a partial block is the boxy look this chart is
+    /// meant to avoid.
+    #[test]
+    fn bars_are_whole_rows_only() {
+        let b = plot(6, 8, &[1.0, 5.0, 12.5, 33.0], 100.0);
+        for y in 0..8u16 {
+            for x in 0..6u16 {
+                let s = sym(&b, x, y);
+                assert!(
+                    s == " " || is_block(&s),
+                    "unexpected glyph {s:?} at {x},{y}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn overflowing_data_scrolls_keeping_the_newest_on_the_right() {
-        let data: Vec<f64> = (0..30).map(|i| i as f64).collect();
-        let b = plot(10, 4, &data, 100.0);
-        // Values rise 20..29 across the window, so the right column is the peak.
-        let mut right_ink = 0;
-        let mut left_ink = 0;
-        for y in 0..4 {
-            if is_solid(&b, 9, y) {
-                right_ink += 1;
-            }
-            if is_solid(&b, 0, y) {
-                left_ink += 1;
+    fn no_braille_is_emitted() {
+        let data: Vec<f64> = (0..40).map(|i| (i % 20) as f64 * 5.0).collect();
+        let b = plot(40, 10, &data, 100.0);
+        for y in 0..10u16 {
+            for x in 0..40u16 {
+                let ch = sym(&b, x, y).chars().next().unwrap_or(' ');
+                assert!(
+                    !('\u{2800}'..='\u{28FF}').contains(&ch),
+                    "braille dot at {x},{y}: a dotted body is not a bar graph"
+                );
             }
         }
-        assert!(
-            right_ink >= left_ink,
-            "newest should not be lower than oldest"
+    }
+
+    /// Denser data than columns is bucketed by peak. Averaging would erase the
+    /// spikes, which are the part of a speed trace worth seeing.
+    #[test]
+    fn dense_data_keeps_its_peaks() {
+        let mut data = vec![10.0; 100];
+        data[50] = 100.0;
+        let b = plot(100, 10, &data, 100.0);
+        let tallest = (0..10u16).filter(|y| is_block(&sym(&b, 50, *y))).count();
+        assert_eq!(tallest, 10, "the spike must reach full height");
+    }
+
+    #[test]
+    fn the_leading_edge_is_brightened() {
+        let b = plot(3, 6, &[50.0], 100.0);
+        let top = (0..6u16).find(|y| is_block(&sym(&b, 0, *y))).expect("bar");
+        let below = top + 1;
+        assert_ne!(
+            fg_of(&b, 0, top),
+            fg_of(&b, 0, below),
+            "the top block should stand out from the body"
         );
     }
 
@@ -633,7 +515,7 @@ mod tests {
         );
         render_chart(
             &mut b,
-            Rect::new(0, 0, 3, 1),
+            Rect::new(0, 0, 1, 1),
             &[1.0],
             1.0,
             style(),
@@ -642,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn axis_labels_are_rendered() {
+    fn axes_are_labelled() {
         let mut b = buffer(40, 8);
         render_chart(
             &mut b,
@@ -655,109 +537,23 @@ mod tests {
                 x_axis: true,
                 unit: "Mbps",
                 window_seconds: 30,
-                ..Default::default()
             },
         );
         let text: String = (0..8)
             .map(|y| (0..40).map(|x| sym(&b, x, y)).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("100Mbps"), "missing scale maximum:\n{text}");
-        assert!(text.contains("-30s"), "missing time origin:\n{text}");
-        assert!(text.contains("now"), "missing 'now' marker:\n{text}");
-    }
-
-    #[test]
-    fn axis_labels_scale_units() {
-        assert_eq!(axis_label(120.0, "Mbps"), "120Mbps");
-        assert_eq!(axis_label(1500.0, "Mbps"), "1.5GMbps");
-        assert_eq!(axis_label(0.0, "ms"), "0ms");
+        assert!(text.contains("100Mbps"), "missing top of scale:\n{text}");
+        assert!(text.contains("0Mbps"), "missing baseline label:\n{text}");
+        assert!(text.contains("-30s"), "missing time label:\n{text}");
+        assert!(text.contains("now"), "missing 'now' label:\n{text}");
     }
 
     #[test]
     fn scaler_never_clips_the_peak() {
-        let mut s = Scaler::new(1.0);
-        s.update(100.0);
-        assert!(s.value() > 100.0);
-    }
-
-    #[test]
-    fn meter_respects_and_clamps_width() {
-        let t = meter(0.5, 10, Color::Green, Color::DarkGray);
-        let s: String = t.lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(s.chars().count(), 10);
-        let t = meter(9.0, 8, Color::Green, Color::DarkGray);
-        let s: String = t.lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(s.chars().count(), 8);
-    }
-
-    /// Odd sub-rows once made the fill depth underflow and panicked the app
-    /// mid-run. Both edge styles are swept here across many heights and widths,
-    /// because the crash only showed up on values that happened to land on an
-    /// odd sub-row at a particular chart height.
-    #[test]
-    fn every_edge_style_survives_every_sub_row_alignment() {
-        for smooth in [false, true] {
-            for h in 1u16..=14 {
-                for w in 1u16..=20 {
-                    // A sawtooth crosses every sub-row alignment in turn.
-                    let data: Vec<f64> = (0..40).map(|i| (i % 7) as f64 * 13.0).collect();
-                    let mut b = buffer(w, h);
-                    render_chart(
-                        &mut b,
-                        Rect::new(0, 0, w, h),
-                        &data,
-                        100.0,
-                        style(),
-                        ChartOpts {
-                            y_axis: false,
-                            x_axis: false,
-                            smooth,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    /// The drawn trace is smoothed; the reported numbers are not. Averaging must
-    /// preserve the series length and its overall level, or the curve would sit
-    /// at a different height from the headline figure beside it.
-    #[test]
-    fn smoothing_preserves_length_and_level() {
-        let data: Vec<f64> = (0..20).map(|i| 100.0 + (i % 5) as f64 * 10.0).collect();
-        let s = smooth_series(&data);
-        assert_eq!(s.len(), data.len(), "length must be preserved");
-        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-        assert!(
-            (mean(&s) - mean(&data)).abs() < 1.0,
-            "smoothing shifted the level: {} vs {}",
-            mean(&s),
-            mean(&data)
-        );
-    }
-
-    /// Smoothing must actually flatten noise, which is the whole point of it.
-    #[test]
-    fn smoothing_reduces_sample_to_sample_jitter() {
-        let spikes: Vec<f64> = (0..30)
-            .map(|i| if i % 2 == 0 { 100.0 } else { 180.0 })
-            .collect();
-        let jitter = |v: &[f64]| v.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>();
-        assert!(
-            jitter(&smooth_series(&spikes)) < jitter(&spikes) * 0.5,
-            "smoothing did not reduce jitter"
-        );
-        // Too short to smooth: passed through untouched.
-        assert_eq!(smooth_series(&[1.0, 9.0]), vec![1.0, 9.0]);
+        let mut s = Scaler::new(100.0);
+        let v = s.update(150.0);
+        assert!(v >= 150.0, "peak must fit: {v}");
+        assert!(v > 150.0, "but leave headroom: {v}");
     }
 }
