@@ -275,23 +275,30 @@ pub fn render_chart(
     // Topmost row the curve reaches in each column, so the fill starts there
     // instead of leaving the stroke hanging over empty space.
     let mut col_top = vec![h; w];
-    //
-    // The stroke is two sub-rows deep, which is an even line rather than a
-    // dotted one. Bridging between sub-columns was tried here and made it worse:
-    // a steep segment joins as a vertical run of dots, and those runs are what
-    // made the curve look like scattered specks. With the trace smoothed, a
-    // half-cell line leaves only occasional small gaps and reads cleanly.
+    // One dot per sub-column: a single sub-row is the thinnest stroke a cell
+    // can draw, and it is what makes the curve read as a line rather than as a
+    // band. Consecutive sub-columns are bridged so a curve that moves between
+    // them stays unbroken, but the bridge is capped - an uncapped one turns a
+    // steep segment into a long vertical run of dots that reads as scattered
+    // specks rather than as a curve.
+    const MAX_BRIDGE: usize = 3;
+    let mut prev: Option<usize> = None;
     for (c, slot) in y_sub.iter().enumerate() {
         let Some(v) = *slot else { continue };
         let y = (v.round().max(0.0) as usize).min(sub_h - 1);
-        let ccx = c / 2;
-        for yy in y..=(y + 1).min(sub_h - 1) {
-            let ccy = yy / sub_rows;
+        let (lo, hi) = match prev {
+            Some(p) if p < y => (p, (p + MAX_BRIDGE).min(y)),
+            Some(p) => ((y + MAX_BRIDGE).min(p), p),
+            None => (y, y),
+        };
+        for yy in lo..=hi {
+            let (ccx, ccy) = (c / 2, yy / sub_rows);
             if ccx < w && ccy < h {
                 line_bits[ccy * w + ccx] |= dot_bit(c % 2, yy % sub_rows);
                 col_top[ccx] = col_top[ccx].min(ccy);
             }
         }
+        prev = Some(y);
     }
 
     for cx in 0..w {
@@ -312,7 +319,7 @@ pub fn render_chart(
             let span = h.saturating_sub(top).max(1) as f64;
             // Start bright enough that the fill visibly meets the line: a top
             // step of near-zero reads as a gap under the curve.
-            let k = 0.16 + 0.42 * (depth / span);
+            let k = 0.10 + 0.34 * (depth / span);
             // Quantise: a per-row ramp spans the full range in as many steps as
             // there are rows, and each step lands as a hard edge, which reads
             // as stripes rather than depth.
