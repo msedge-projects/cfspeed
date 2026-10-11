@@ -6,6 +6,8 @@ mod speed;
 mod ui;
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -65,10 +67,15 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 
 async fn event_loop(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
-    start_run(&tx, app.mode);
+
+    // One tagged channel for the UI. Each run gets its own inner channel and a
+    // forwarder that stamps the generation, so a superseded run can never
+    // deliver events into the current test.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(u64, Event)>();
+    let mut cancel = Arc::new(AtomicBool::new(false));
 
     app.begin_run();
+    start_run(&out_tx, app.mode, app.generation, Arc::clone(&cancel));
 
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(FRAME);
@@ -79,8 +86,8 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
 
         tokio::select! {
             // Measurement events take priority so charts stay smooth.
-            Some(ev) = rx.recv() => {
-                app.on_event(ev);
+            Some((gen, ev)) = out_rx.recv() => {
+                app.on_event(gen, ev);
             }
             maybe = events.next() => {
                 match maybe {
@@ -109,27 +116,54 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
             break;
         }
         if app.restart {
-            start_run(&tx, app.mode);
+            // Stop the superseded run before starting the next one, so it
+            // stops competing for bandwidth immediately.
+            cancel.store(true, Ordering::Relaxed);
             app.begin_run();
+            cancel = Arc::new(AtomicBool::new(false));
+            start_run(&out_tx, app.mode, app.generation, Arc::clone(&cancel));
         }
     }
 
+    cancel.store(true, Ordering::Relaxed);
     Ok(())
 }
 
-/// Spawn a measurement run. The engine streams [`Event`]s back over `tx`.
-fn start_run(tx: &mpsc::UnboundedSender<Event>, mode: TestMode) {
-    let tx = tx.clone();
+/// Spawn a measurement run, forwarding its events onto the shared tagged
+/// channel.
+fn start_run(
+    out: &mpsc::UnboundedSender<(u64, Event)>,
+    mode: TestMode,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+) {
+    let out = out.clone();
     tokio::spawn(async move {
-        let config = Config {
-            mode,
-            ..Config::default()
+        // A private channel per run: once this forwarder returns, the receiver
+        // drops and any in-flight sends from the old runner fail harmlessly.
+        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+
+        let runner = {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let config = Config {
+                    mode,
+                    ..Config::default()
+                };
+                match Runner::new(config) {
+                    Ok(r) => r.run(tx, cancel).await,
+                    Err(e) => {
+                        let _ = tx.send(Event::Failed(format!("could not start: {e}")));
+                    }
+                }
+            })
         };
-        match Runner::new(config) {
-            Ok(runner) => runner.run(tx).await,
-            Err(e) => {
-                let _ = tx.send(Event::Failed(format!("could not start: {e}")));
+
+        while let Some(ev) = rx.recv().await {
+            if out.send((generation, ev)).is_err() {
+                break;
             }
         }
+        runner.abort();
     });
 }

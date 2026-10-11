@@ -176,6 +176,10 @@ pub struct App {
     pub error: Option<String>,
     pub restart: bool,
     pub quit: bool,
+
+    /// Identifies the current run. Events tagged with an older generation are
+    /// discarded, so a superseded runner can never mix samples into a new test.
+    pub generation: u64,
 }
 
 impl App {
@@ -208,11 +212,19 @@ impl App {
             error: None,
             restart: false,
             quit: false,
+            generation: 0,
         }
     }
 
     /// Ingest one event from the measurement engine.
-    pub fn on_event(&mut self, ev: Event) {
+    ///
+    /// `generation` is the id the event was produced under. Events from a
+    /// superseded run are dropped: without this, choosing a different test
+    /// mid-run would interleave two runners' samples into one curve.
+    pub fn on_event(&mut self, generation: u64, ev: Event) {
+        if generation != self.generation {
+            return;
+        }
         match ev {
             Event::Meta(meta) => {
                 self.meta = *meta;
@@ -288,7 +300,13 @@ impl App {
         self.up_samples.clear();
         self.probe_samples.clear();
         self.instant = 0.0;
+        // Clear the previous connection details, otherwise the old IP and edge
+        // stay on screen labelled as current until the new metadata arrives.
+        self.meta = Meta::default();
         self.phase = Phase::Connecting;
+        // Bump the generation so anything still in flight from the previous
+        // run is ignored.
+        self.generation = self.generation.wrapping_add(1);
         self.started = Some(Instant::now());
         self.elapsed = Duration::ZERO;
         self.down_scaler.reset(1.0);
@@ -515,14 +533,14 @@ mod tests {
     #[test]
     fn ticks_accumulate_per_phase() {
         let mut a = app();
-        a.on_event(Event::Phase(Phase::Download));
-        a.on_event(Event::Tick { mbps: 10.0 });
-        a.on_event(Event::Tick { mbps: 20.0 });
+        a.on_event(0, Event::Phase(Phase::Download));
+        a.on_event(0, Event::Tick { mbps: 10.0 });
+        a.on_event(0, Event::Tick { mbps: 20.0 });
         assert_eq!(a.down_samples, vec![10.0, 20.0]);
         assert!(a.up_samples.is_empty(), "upload must stay separate");
 
-        a.on_event(Event::Phase(Phase::Upload));
-        a.on_event(Event::Tick { mbps: 5.0 });
+        a.on_event(0, Event::Phase(Phase::Upload));
+        a.on_event(0, Event::Tick { mbps: 5.0 });
         assert_eq!(a.up_samples, vec![5.0]);
         assert_eq!(
             a.down_samples,
@@ -534,18 +552,18 @@ mod tests {
     #[test]
     fn starting_a_phase_clears_its_samples() {
         let mut a = app();
-        a.on_event(Event::Phase(Phase::Download));
-        a.on_event(Event::Tick { mbps: 10.0 });
-        a.on_event(Event::Phase(Phase::Download));
+        a.on_event(0, Event::Phase(Phase::Download));
+        a.on_event(0, Event::Tick { mbps: 10.0 });
+        a.on_event(0, Event::Phase(Phase::Download));
         assert!(a.down_samples.is_empty());
     }
 
     #[test]
     fn samples_are_capped() {
         let mut a = app();
-        a.on_event(Event::Phase(Phase::Download));
+        a.on_event(0, Event::Phase(Phase::Download));
         for i in 0..(MAX_POINTS + 250) {
-            a.on_event(Event::Tick { mbps: i as f64 });
+            a.on_event(0, Event::Tick { mbps: i as f64 });
         }
         assert_eq!(a.down_samples.len(), MAX_POINTS);
     }
@@ -553,8 +571,8 @@ mod tests {
     #[test]
     fn scaler_tracks_peak_instantly() {
         let mut a = app();
-        a.on_event(Event::Phase(Phase::Download));
-        a.on_event(Event::Tick { mbps: 500.0 });
+        a.on_event(0, Event::Phase(Phase::Download));
+        a.on_event(0, Event::Tick { mbps: 500.0 });
         assert!(a.down_scaler.value() >= 500.0);
     }
 
@@ -568,7 +586,7 @@ mod tests {
     #[test]
     fn failure_records_message() {
         let mut a = app();
-        a.on_event(Event::Failed("boom".into()));
+        a.on_event(0, Event::Failed("boom".into()));
         assert_eq!(a.error.as_deref(), Some("boom"));
         assert!(!a.running);
     }
@@ -660,6 +678,69 @@ mod tests {
         // Edge case: the row just past the last column of a tab.
         a.on_click(8, 30);
         assert_eq!(a.view, View::History);
+    }
+
+    /// A superseded run must not write samples into the new test. Choosing a
+    /// different mode mid-run leaves the previous runner in flight for a moment.
+    #[test]
+    fn events_from_a_superseded_run_are_ignored() {
+        let mut a = app();
+        a.begin_run();
+        // Ticks only accumulate while a phase is active, and begin_run resets
+        // to Connecting, so drive the phase explicitly.
+        a.on_event(a.generation, Event::Phase(Phase::Download));
+        let current = a.generation;
+        a.on_event(current, Event::Tick { mbps: 100.0 });
+        assert_eq!(a.down_samples, vec![100.0]);
+
+        // Restart, then a straggler from the old run arrives.
+        a.begin_run();
+        assert_ne!(a.generation, current, "restart must bump the generation");
+        a.on_event(a.generation, Event::Phase(Phase::Download));
+        a.on_event(current, Event::Tick { mbps: 999.0 });
+        assert!(
+            a.down_samples.is_empty(),
+            "stale sample leaked into the new run: {:?}",
+            a.down_samples
+        );
+
+        // The new run's own events still land.
+        a.on_event(a.generation, Event::Tick { mbps: 50.0 });
+        assert_eq!(a.down_samples, vec![50.0]);
+    }
+
+    #[test]
+    fn a_superseded_run_cannot_publish_a_result() {
+        let mut a = app();
+        a.begin_run();
+        let stale = a.generation;
+        a.begin_run();
+        let run = RunResult::default();
+        a.on_event(stale, Event::Finished(Box::new(run)));
+        assert!(a.result.is_none(), "stale run wrote a result");
+        assert!(a.history.is_empty(), "stale run wrote history");
+    }
+
+    #[test]
+    fn begin_run_clears_stale_connection_details() {
+        let mut a = app();
+        a.meta.ip = "203.0.113.9".into();
+        a.meta.colo = "MAA".into();
+        a.meta.edge_ips = vec!["162.159.140.220".into()];
+        a.begin_run();
+        assert!(a.meta.ip.is_empty(), "old IP still shown for the new run");
+        assert!(a.meta.colo.is_empty(), "old edge still shown");
+        assert!(a.meta.edge_ips.is_empty(), "old edge addresses still shown");
+    }
+
+    #[test]
+    fn choosing_a_mode_mid_run_requests_a_restart() {
+        let mut a = app();
+        a.running = true;
+        a.restart = false;
+        a.on_key(press('d'));
+        assert!(a.restart, "switching mode must supersede the running test");
+        assert_eq!(a.mode, TestMode::Download);
     }
 
     #[test]

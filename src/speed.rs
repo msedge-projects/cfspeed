@@ -4,7 +4,7 @@
 //! cadence so the UI has a smooth signal to graph, rather than one number at
 //! the end of a phase.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -177,7 +177,7 @@ pub struct ThroughputStats {
     pub samples: Vec<f64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RunResult {
     pub timestamp_ms: u64,
     pub meta: Meta,
@@ -459,14 +459,24 @@ impl Runner {
         meta
     }
 
-    /// Run a full test, emitting [`Event`]s as it progresses.
-    pub async fn run(self, tx: mpsc::UnboundedSender<Event>) {
-        if let Err(e) = self.run_inner(&tx).await {
-            let _ = tx.send(Event::Failed(e.to_string()));
+    /// Run a test, emitting [`Event`]s as it progresses.
+    ///
+    /// `cancel` lets a superseded run bail out early, so switching test mode
+    /// mid-run stops the old measurement instead of leaving it racing the new
+    /// one for bandwidth.
+    pub async fn run(self, tx: mpsc::UnboundedSender<Event>, cancel: Arc<AtomicBool>) {
+        if let Err(e) = self.run_inner(&tx, &cancel).await {
+            if !cancelled(&cancel) {
+                let _ = tx.send(Event::Failed(e.to_string()));
+            }
         }
     }
 
-    async fn run_inner(&self, tx: &mpsc::UnboundedSender<Event>) -> Result<()> {
+    async fn run_inner(
+        &self,
+        tx: &mpsc::UnboundedSender<Event>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<()> {
         let _ = tx.send(Event::Phase(Phase::Connecting));
         let meta = self.fetch_meta().await;
         let _ = tx.send(Event::Meta(Box::new(meta.clone())));
@@ -478,7 +488,7 @@ impl Runner {
         // Aim for ~8 probes regardless of how slow each probe takes.
         let gap = (self.config.idle_duration / 8)
             .clamp(Duration::from_millis(100), Duration::from_millis(500));
-        while Instant::now() < idle_deadline {
+        while Instant::now() < idle_deadline && !cancelled(cancel) {
             let sent = Instant::now();
             match self
                 .client
@@ -515,6 +525,7 @@ impl Runner {
                     download_chunk: self.config.download_chunk,
                 },
                 tx,
+                cancel,
             )
             .await?
         } else {
@@ -534,11 +545,17 @@ impl Runner {
                     download_chunk: self.config.download_chunk,
                 },
                 tx,
+                cancel,
             )
             .await?
         } else {
             (ThroughputStats::default(), LatencyStats::default())
         };
+
+        // A cancelled run must not publish a result or write history.
+        if cancelled(cancel) {
+            return Ok(());
+        }
 
         let _ = tx.send(Event::Phase(Phase::Finalising));
         let result = RunResult {
@@ -567,6 +584,11 @@ enum Direction {
     Up,
 }
 
+/// True once the owning run has been superseded and should stop working.
+fn cancelled(flag: &Arc<AtomicBool>) -> bool {
+    flag.load(Ordering::Relaxed)
+}
+
 /// Parameters for a single throughput phase.
 struct PhaseSpec<'a> {
     client: &'a reqwest::Client,
@@ -586,6 +608,7 @@ struct PhaseSpec<'a> {
 async fn run_phase(
     spec: PhaseSpec<'_>,
     tx: &mpsc::UnboundedSender<Event>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(ThroughputStats, LatencyStats)> {
     let PhaseSpec {
         client,
@@ -624,11 +647,11 @@ async fn run_phase(
     let mut last_bytes = 0u64;
     let mut last = Instant::now();
     loop {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || cancelled(cancel) {
             break;
         }
         tokio::time::sleep(sample_interval).await;
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || cancelled(cancel) {
             break;
         }
 
