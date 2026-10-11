@@ -2,9 +2,21 @@
 //!
 //! The body under the curve is painted with *background colour* rather than
 //! glyphs. A cell carrying a background fills its whole area with no gaps, so
-//! the area reads as one solid shape. The crest is a half-block glyph, the only
-//! way to split a cell horizontally while staying solid, which places the edge
-//! between the two sub-rows of a cell rather than on a cell boundary.
+//! the area reads as one solid shape.
+//!
+//! A background covers the entire cell, so on its own it quantises the top edge
+//! to a cell boundary and the curve steps once per cell. Two renderings deal
+//! with that, and the palette switches between them:
+//!
+//! * `smooth` (default) draws the single cell the wave crosses with braille, so
+//!   the edge lands on any of four sub-rows and two horizontal steps per cell.
+//!   Those dots are the only textured part of the chart.
+//! * `solid` uses a half-block for the crest and no dots anywhere, trading the
+//!   finer edge for a completely dot-free chart.
+//!
+//! The fill is deliberately a light tint. A heavy fill makes the quantised edge
+//! the dominant thing on screen and the chart stops reading as a curve; keeping
+//! it faint lets the eye follow the edge instead.
 //!
 //! Two earlier revisions failed this. The `▁▂▃▄▅▆▇█` block ramp is readable but steps
 //! a whole character per column. Filling with braille has finer resolution but
@@ -228,30 +240,6 @@ pub fn render_chart(
     // Smooth mode draws the wave itself as a braille stroke, giving the edge
     // four steps per cell vertically and two horizontally. Only the stroke is
     // dots - the body underneath is still painted solid.
-    let mut line_bits = vec![0u8; w * h];
-    if opts.smooth {
-        let mut prev: Option<usize> = None;
-        for (c, slot) in y_sub.iter().enumerate() {
-            let Some(v) = *slot else { continue };
-            let y = (v.round().max(0.0) as usize).min(sub_h - 1);
-            // Bridge the vertical gap so a steep step is one stroke rather than
-            // two detached dots.
-            let (lo, hi) = match prev {
-                Some(p) if p < y => (p, y),
-                Some(p) if p > y => (y, p),
-                _ => (y, y),
-            };
-            for yy in lo..=hi {
-                let ccx = c / 2;
-                let ccy = yy / sub_rows;
-                if ccx < w && ccy < h {
-                    line_bits[ccy * w + ccx] |= dot_bit(c % 2, yy % sub_rows);
-                }
-            }
-            prev = Some(y);
-        }
-    }
-
     let grid_style = Style::default().fg(style.axis);
     let grid_row = plot.height / 2;
 
@@ -267,10 +255,20 @@ pub fn render_chart(
     for (cx, slot) in y_cell.iter().enumerate() {
         let Some(y) = *slot else { continue };
         let cell_x = plot.x + cx as u16;
+        // First row the body reaches in this column. The fill fades from here
+        // down to the baseline, so the area reads as lit by the curve rather
+        // than as a slab dropped in from the top.
+        let crest_row = y.div_ceil(sub_rows);
+        // Only smooth mode can legitimately fill nothing: at the baseline there
+        // is no area under the curve at all. Solid mode still draws its crest
+        // there, which is what keeps a trace that touches zero continuous.
+        if opts.smooth && crest_row >= h {
+            continue;
+        }
         for cy in 0..h {
             let cell_top = cy * sub_rows;
             if opts.smooth {
-                if cy * sub_rows < y {
+                if cy < crest_row {
                     continue;
                 }
             } else if y > cell_top + sub_rows - 1 {
@@ -281,25 +279,45 @@ pub fn render_chart(
             let Some(cell) = buf.cell_mut(pos) else {
                 continue;
             };
-            // The body settles toward the baseline, which anchors the shape
-            // instead of leaving a flat slab of one colour.
-            let t = cy as f64 / h.max(1) as f64;
-            let body = theme::blend(theme::SURFACE, style.fill, 0.40 + (1.0 - t) * 0.30);
+            // A background fill covers its whole cell, so the body's top edge is
+            // quantised to the cell and can never be as fine as the stroke. A
+            // heavy fill makes that stair-step the dominant thing on screen and
+            // the curve stops reading as a curve. Keeping the tint light lets
+            // the eye follow the stroke instead, which is the part that is
+            // drawn at full resolution.
+            let body = if opts.smooth {
+                let depth = (cy - crest_row) as f64;
+                let span = h.saturating_sub(crest_row).max(1) as f64;
+                let k = 0.34 * (1.0 - depth / span) + 0.07;
+                // Quantise the ramp. A per-row gradient spans the full range in
+                // as many steps as there are rows, and each one lands as a hard
+                // edge, which reads as stripes across the fill rather than as
+                // depth. Few wide steps blend into each other.
+                const FILL_STEPS: f64 = 4.0;
+                let k = (k * FILL_STEPS).round() / FILL_STEPS;
+                theme::blend(theme::SURFACE, style.fill, k)
+            } else {
+                let t = cy as f64 / h.max(1) as f64;
+                theme::blend(theme::SURFACE, style.fill, 0.40 + (1.0 - t) * 0.30)
+            };
 
-            if opts.smooth {
-                // The body is solid background either way. In the cell the wave
-                // passes through, the stroke is drawn on top of it, so the edge
-                // can land anywhere within the cell instead of on its boundary.
-                let bits = line_bits[cy * w + cx];
-                if bits == 0 {
-                    // Plain body: a blank glyph keeps the cell free of any
-                    // braille code point at all.
-                    cell.set_symbol(" ");
-                    cell.set_style(Style::default().bg(body));
-                } else {
-                    cell.set_symbol(braille_from_bits(bits).encode_utf8(&mut [0u8; 4]));
-                    cell.set_style(Style::default().fg(style.line).bg(body));
+            if opts.smooth && cy > crest_row {
+                // Below the crest cell the area is solid background. Only the
+                // single cell the wave passes through is drawn with dots, so
+                // the edge can land on any of four sub-rows instead of stepping
+                // once per cell. Extending the dots downward as well would
+                // turn the whole body into a field of them again.
+                cell.set_symbol(" ");
+                cell.set_style(Style::default().bg(body));
+            } else if opts.smooth {
+                let mut bits = 0u8;
+                for sy in 0..sub_rows {
+                    if cell_top + sy > y {
+                        bits |= dot_bit(0, sy) | dot_bit(1, sy);
+                    }
                 }
+                cell.set_symbol(braille_from_bits(bits).encode_utf8(&mut [0u8; 4]));
+                cell.set_style(Style::default().fg(body));
             } else if y == cell_top + 1 {
                 // The curve sits in this cell's lower half, so the crest fills
                 // it and the upper half keeps the background.
