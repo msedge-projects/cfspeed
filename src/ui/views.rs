@@ -466,6 +466,7 @@ fn phase_column(
         samples,
         scale_max,
         ChartStyle {
+            line: line_color(color),
             fill: color,
             axis: theme::BORDER,
         },
@@ -561,6 +562,7 @@ fn charts(frame: &mut Frame, area: Rect, app: &App) {
             samples,
             max,
             ChartStyle {
+                line: line_color(color),
                 fill: color,
                 axis: theme::BORDER,
             },
@@ -959,6 +961,7 @@ fn history(frame: &mut Frame, area: Rect, app: &App) {
         &downs,
         peak,
         ChartStyle {
+            line: line_color(ACCENT_DOWN),
             fill: ACCENT_DOWN,
             axis: theme::BORDER,
         },
@@ -1038,6 +1041,12 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
         )),
     ]);
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// A lightened accent for the curve stroke, so the edge stays crisp against
+/// the darker filled body beneath it.
+fn line_color(accent: Color) -> Color {
+    theme::blend(theme::TEXT_BRIGHT, accent, 0.45)
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn charts_render_block_glyphs_not_braille() {
+    fn charts_draw_a_smooth_braille_curve_not_block_bars() {
         let mut app = App::new();
         app.view = View::Charts;
         app.down_samples = (0..40).map(|i| (i % 20) as f64 * 6.0).collect();
@@ -1255,14 +1264,20 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+
+        // Braille sub-pixels give the curve 8x the vertical resolution of a
+        // character cell, which is what removes the staircase.
         assert!(
-            !text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
-            "braille dots should be gone"
+            text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "expected a braille curve"
         );
-        assert!(
-            text.contains('▇') || text.contains('█'),
-            "expected block glyphs in the chart"
-        );
+        // The block ramp is what produced the boxy look; it must not come back.
+        for glyph in ['▁', '▂', '▃', '▄', '▅', '▆', '▇'] {
+            assert!(
+                !text.contains(glyph),
+                "block-ramp glyph {glyph:?} makes the chart look boxy"
+            );
+        }
     }
 
     #[test]

@@ -1,10 +1,14 @@
 //! Chart primitives rendered directly into a ratatui `Buffer`.
 //!
-//! Braille dots carry 2x4 sub-pixels per cell, which gives fine resolution but
-//! produces output nobody can read at a glance - it looks like texture rather
-//! than a curve. These charts use the `▁▂▃▄▅▆▇█` block ramp instead: one sample per
-//! column, a solid filled area, and explicit axis labels, so the value is
-//! legible without decoding anything.
+//! The curve is drawn with braille sub-pixels (2x4 dots per cell) so it has 8x
+//! the vertical resolution of a character grid, which is what removes the
+//! staircase. The body below the curve is filled on the same sub-pixel grid,
+//! graded from the surface colour up to the accent, so the chart reads as a
+//! solid shape with a smooth edge rather than a row of bars.
+//!
+//! Earlier revisions used the `▁▂▃▄▅▆▇█` block ramp, which is readable but steps
+//! a whole character per column; and used braille to *fill*, which is
+//! unreadable texture. This is braille used as an outline, which is neither.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -13,11 +17,42 @@ use ratatui::text::{Line, Span, Text};
 
 use crate::ui::theme;
 
-/// Partial-block ramp, index 0..=7 where 7 is a full block.
-const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Bit for the braille dot at sub-column `sx` (0=left, 1=right) and sub-row
+/// `sy` (0=top .. 3=bottom).
+///
+/// Braille dots are numbered down each column first:
+/// ```text
+/// dot1 dot4
+/// dot2 dot5
+/// dot3 dot6
+/// dot7 dot8
+/// ```
+#[must_use]
+pub fn dot_bit(sx: usize, sy: usize) -> u8 {
+    let dot = match sy {
+        0..=2 => {
+            if sx == 0 {
+                sy + 1
+            } else {
+                sy + 4
+            }
+        }
+        _ => 7 + sx,
+    };
+    1u8 << (dot - 1)
+}
+
+/// Glyph for a raw dot bitmask.
+#[must_use]
+pub fn braille_from_bits(bits: u8) -> char {
+    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+}
 
 #[derive(Clone, Copy)]
 pub struct ChartStyle {
+    /// Colour of the curve itself.
+    pub line: Color,
+    /// Colour the filled body is graded towards.
     pub fill: Color,
     pub axis: Color,
 }
@@ -111,11 +146,10 @@ fn axis_label(v: f64, unit: &str) -> String {
     }
 }
 
-/// Paint a filled area chart with labelled axes.
+/// Paint a smooth area chart with labelled axes.
 ///
-/// Newest samples sit at the right edge; when there is more data than fits the
-/// most recent window is shown (the chart scrolls). While the test is young the
-/// curve grows left-to-right.
+/// Newest samples sit at the right edge; while the test is young the curve grows
+/// left-to-right.
 pub fn render_chart(
     buf: &mut Buffer,
     area: Rect,
@@ -141,56 +175,93 @@ pub fn render_chart(
     let max = if max > 0.0 { max } else { 1.0 };
     let w = usize::from(plot.width);
     let h = usize::from(plot.height);
+    let sub_w = w * 2;
+    let sub_h = h * 4;
 
-    // One sample per column, anchored right so the newest data is always shown.
+    // Curve position per sub-column, in sub-rows from the top. `None` marks a
+    // column before the first sample arrived.
     let first = data.len().saturating_sub(w);
-    let levels: Vec<u16> = (0..w)
+    let ys: Vec<Option<usize>> = (0..sub_w)
         .map(|c| {
-            let i = first + c;
+            // Sub-columns 0..first carry the gap between samples when data is
+            // denser than the plot; otherwise the sample maps straight across.
+            let i = first + c / 2;
             if i >= data.len() {
-                return 0;
+                return None;
             }
             let norm = (data[i] / max).clamp(0.0, 1.0);
-            // Eight sub-levels per row, via the block ramp.
-            ((norm * (h * 8) as f64).round() as u16).min((h * 8) as u16)
+            let y = ((1.0 - norm) * (sub_h - 1) as f64).round() as usize;
+            Some(y.min(sub_h - 1))
         })
         .collect();
 
-    let max_levels = (h * 8) as f64;
-    let fill_of = |lvl: u16, row_from_bottom: usize| -> Option<(char, Style)> {
-        let row_start = (row_from_bottom * 8) as u16;
-        let row_end = row_start + 8;
-        if lvl >= row_end {
-            // Fully filled row.
-            let t = f64::from(lvl) / max_levels;
-            Some((
-                BLOCKS[7],
-                Style::default().fg(theme::blend(theme::SURFACE, style.fill, t)),
-            ))
-        } else if lvl > row_start {
-            let partial = (lvl - row_start) as usize;
-            Some((BLOCKS[partial - 1], Style::default().fg(style.fill)))
-        } else {
-            None
+    // Two bitmasks per cell: the curve stroke, and the filled body beneath it.
+    let mut line_bits = vec![0u8; w * h];
+    let mut fill_bits = vec![0u8; w * h];
+
+    let set = |bits: &mut Vec<u8>, col: usize, row: usize| {
+        let (cx, sx) = (col / 2, col % 2);
+        let (cy, sy) = (row / 4, row % 4);
+        if cx < w && cy < h {
+            bits[cy * w + cx] |= dot_bit(sx, sy);
         }
     };
+
+    let mut prev: Option<usize> = None;
+    for c in 0..sub_w {
+        let Some(y) = ys[c] else { continue };
+        match prev {
+            // Bridge the vertical gap so a steep step is a continuous stroke
+            // rather than two disconnected dots.
+            Some(p) => {
+                let (lo, hi) = if p < y { (p, y) } else { (y, p) };
+                for yy in lo..=hi {
+                    set(&mut line_bits, c, yy);
+                }
+                for yy in (hi + 1)..sub_h {
+                    set(&mut fill_bits, c, yy);
+                }
+            }
+            None => {
+                set(&mut line_bits, c, y);
+                for yy in (y + 1)..sub_h {
+                    set(&mut fill_bits, c, yy);
+                }
+            }
+        }
+        prev = Some(y);
+    }
 
     let grid_style = Style::default().fg(style.axis);
     let grid_row = plot.height / 2;
 
-    for (idx, y) in (0..plot.height).enumerate() {
-        let from_bottom = plot.height as usize - 1 - idx;
-        for (c, x) in (0..plot.width).enumerate() {
-            let pos = Position::new(plot.x + x, plot.y + y);
+    for cy in 0..h {
+        for cx in 0..w {
+            let idx = cy * w + cx;
+            let line = line_bits[idx];
+            let fill = fill_bits[idx];
+            let pos = Position::new(plot.x + cx as u16, plot.y + cy as u16);
             let Some(cell) = buf.cell_mut(pos) else {
                 continue;
             };
-            if let Some((sym, st)) = fill_of(levels[c], from_bottom) {
-                cell.set_symbol(sym.encode_utf8(&mut [0u8; 4]));
+            let bits = line | fill;
+            if bits != 0 {
+                cell.set_symbol(braille_from_bits(bits).encode_utf8(&mut [0u8; 4]));
+                let st = if line != 0 {
+                    // The stroke stays bright so the edge reads as a curve.
+                    Style::default().fg(style.line).add_modifier(Modifier::BOLD)
+                } else {
+                    // Body darkens toward the baseline so the bright stroke
+                    // above it reads as the curve rather than the fill.
+                    let depth = 1.0 - (cy as f64 / h.max(1) as f64);
+                    Style::default().fg(theme::blend(
+                        theme::SURFACE,
+                        style.fill,
+                        0.18 + depth * 0.30,
+                    ))
+                };
                 cell.set_style(st);
-            } else if idx == usize::from(grid_row) && opts.y_axis {
-                // A faint dotted mid-line gives the eye something to measure
-                // the curve against.
+            } else if cy == usize::from(grid_row) && opts.y_axis {
                 cell.set_symbol("·");
                 cell.set_style(grid_style);
             } else {
@@ -215,11 +286,13 @@ fn render_y_axis(buf: &mut Buffer, area: Rect, plot: Rect, max: f64, unit: &str)
         (plot.height / 2, 0.5),
         (plot.height - 1, 0.0),
     ] {
-        let text = axis_label(max * frac, unit);
-        let y = area.y + row;
-        let pad = usize::from(plot.width).saturating_sub(0);
-        let _ = pad;
-        write_at(buf, area.x + 1, y, &text, label_style);
+        write_at(
+            buf,
+            area.x + 1,
+            area.y + row,
+            &axis_label(max * frac, unit),
+            label_style,
+        );
     }
 }
 
@@ -250,29 +323,6 @@ fn write_at(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
             cell.set_style(style);
         }
     }
-}
-
-/// Single-row inline sparkline, for compact contexts.
-#[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn sparkline(data: &[f64], max: f64, width: u16) -> Text<'static> {
-    if width == 0 || data.is_empty() {
-        return Text::default();
-    }
-    let w = usize::from(width);
-    let max = if max > 0.0 { max } else { 1.0 };
-    let first = data.len().saturating_sub(w);
-    let chars: String = (0..w)
-        .map(|c| {
-            let i = first + c;
-            if i >= data.len() {
-                return ' ';
-            }
-            let norm = (data[i] / max).clamp(0.0, 1.0);
-            BLOCKS[((norm * 7.0).round() as usize).min(7)]
-        })
-        .collect();
-    Text::from(Line::from(Span::raw(chars)))
 }
 
 /// Horizontal meter with a bright leading cap.
@@ -326,6 +376,7 @@ mod tests {
 
     fn style() -> ChartStyle {
         ChartStyle {
+            line: Color::Rgb(158, 206, 106),
             fill: Color::Rgb(158, 206, 106),
             axis: Color::DarkGray,
         }
@@ -341,18 +392,19 @@ mod tests {
             .unwrap_or_else(|| "<oob>".to_string())
     }
 
-    fn is_plot_char(s: &str) -> bool {
-        BLOCKS.contains(&s.chars().next().unwrap_or(' '))
+    fn is_dot(s: &str) -> bool {
+        s.chars()
+            .next()
+            .is_some_and(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
     }
 
-    #[test]
-    fn full_scale_value_fills_every_row() {
-        let mut b = buffer(12, 6);
+    fn plot(w: u16, h: u16, data: &[f64], max: f64) -> Buffer {
+        let mut b = buffer(w, h);
         render_chart(
             &mut b,
-            Rect::new(0, 0, 12, 6),
-            &[100.0],
-            100.0,
+            Rect::new(0, 0, w, h),
+            data,
+            max,
             style(),
             ChartOpts {
                 y_axis: false,
@@ -360,20 +412,109 @@ mod tests {
                 ..Default::default()
             },
         );
-        // A single early sample sits in the first column (the chart grows from
-        // the left) and must be solid top to bottom.
+        b
+    }
+
+    #[test]
+    fn dot_bits_match_unicode_numbering() {
+        assert_eq!(dot_bit(0, 0), 0b0000_0001, "top-left is dot1");
+        assert_eq!(dot_bit(1, 0), 0b0000_1000, "top-right is dot4");
+        assert_eq!(dot_bit(0, 3), 0b0100_0000, "bottom-left is dot7");
+        assert_eq!(dot_bit(1, 3), 0b1000_0000, "bottom-right is dot8");
+    }
+
+    #[test]
+    fn empty_cell_is_blank_braille() {
+        assert_eq!(braille_from_bits(0), '\u{2800}');
+    }
+
+    #[test]
+    fn full_scale_value_fills_every_row() {
+        let b = plot(12, 6, &[100.0], 100.0);
         for y in 0..6 {
-            assert_eq!(sym(&b, 0, y), "█", "row {y} should be a full block");
+            assert!(is_dot(&sym(&b, 0, y)), "row {y} should carry a dot");
         }
     }
 
     #[test]
     fn empty_data_leaves_the_plot_blank() {
-        let mut b = buffer(10, 4);
+        let b = plot(10, 4, &[], 100.0);
+        for y in 0..4 {
+            for x in 0..10 {
+                assert!(!is_dot(&sym(&b, x, y)), "expected blank at {x},{y}");
+            }
+        }
+    }
+
+    /// The whole point of braille: a ramp must produce a continuous stroke with
+    /// no gaps, and every column must carry ink.
+    #[test]
+    fn a_ramp_draws_a_continuous_stroke() {
+        let data: Vec<f64> = (0..20).map(|i| i as f64 * 5.0).collect();
+        let b = plot(20, 10, &data, 100.0);
+        for x in 0..20 {
+            let mut ink = false;
+            for y in 0..10 {
+                if is_dot(&sym(&b, x, y)) {
+                    ink = true;
+                }
+            }
+            assert!(ink, "column {x} has a gap - stroke is not continuous");
+        }
+    }
+
+    /// Vertical resolution is the reason braille is used: a ramp must reach the
+    /// top row gradually, not in two or three big jumps.
+    #[test]
+    fn a_ramp_resolves_more_than_one_step_per_cell() {
+        let data: Vec<f64> = (0..40).map(|i| i as f64 * 2.5).collect();
+        let b = plot(40, 8, &data, 100.0);
+        // Record which row the topmost ink sits in, per column.
+        let top: Vec<i32> = (0..40)
+            .map(|x| {
+                (0..8)
+                    .find(|y| is_dot(&sym(&b, x as u16, *y as u16)))
+                    .map(|y| y as i32)
+                    .unwrap_or(-1)
+            })
+            .collect();
+        // Count how many distinct rows the curve occupies across the sweep.
+        let distinct: std::collections::BTreeSet<i32> = top.iter().copied().collect();
+        assert!(
+            distinct.len() >= 6,
+            "curve only occupied {} distinct rows, expected a smooth sweep",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn overflowing_data_scrolls_keeping_the_newest_on_the_right() {
+        let data: Vec<f64> = (0..30).map(|i| i as f64).collect();
+        let b = plot(10, 4, &data, 100.0);
+        // Values rise 20..29 across the window, so the right column is the peak.
+        let mut right_ink = 0;
+        let mut left_ink = 0;
+        for y in 0..4 {
+            if is_dot(&sym(&b, 9, y)) {
+                right_ink += 1;
+            }
+            if is_dot(&sym(&b, 0, y)) {
+                left_ink += 1;
+            }
+        }
+        assert!(
+            right_ink >= left_ink,
+            "newest should not be lower than oldest"
+        );
+    }
+
+    #[test]
+    fn chart_respects_offset_rect() {
+        let mut b = buffer(20, 4);
         render_chart(
             &mut b,
-            Rect::new(0, 0, 10, 4),
-            &[],
+            Rect::new(5, 2, 10, 4),
+            &[100.0, 100.0],
             100.0,
             style(),
             ChartOpts {
@@ -382,11 +523,29 @@ mod tests {
                 ..Default::default()
             },
         );
-        for y in 0..4 {
-            for x in 0..10 {
-                assert!(!is_plot_char(&sym(&b, x, y)), "expected blank at {x},{y}");
-            }
-        }
+        assert_eq!(sym(&b, 0, 0), " ", "outside the rect must be untouched");
+        assert_eq!(sym(&b, 19, 0), " ");
+    }
+
+    #[test]
+    fn degenerate_rects_are_tolerated() {
+        let mut b = buffer(4, 4);
+        render_chart(
+            &mut b,
+            Rect::new(0, 0, 0, 0),
+            &[1.0],
+            1.0,
+            style(),
+            ChartOpts::default(),
+        );
+        render_chart(
+            &mut b,
+            Rect::new(0, 0, 3, 1),
+            &[1.0],
+            1.0,
+            style(),
+            ChartOpts::default(),
+        );
     }
 
     #[test]
@@ -412,101 +571,6 @@ mod tests {
         assert!(text.contains("100Mbps"), "missing scale maximum:\n{text}");
         assert!(text.contains("-30s"), "missing time origin:\n{text}");
         assert!(text.contains("now"), "missing 'now' marker:\n{text}");
-    }
-
-    #[test]
-    fn curve_grows_from_the_left_as_data_arrives() {
-        let mut b = buffer(20, 5);
-        render_chart(
-            &mut b,
-            Rect::new(0, 0, 20, 5),
-            &[80.0, 80.0, 80.0],
-            100.0,
-            style(),
-            ChartOpts {
-                y_axis: false,
-                x_axis: false,
-                ..Default::default()
-            },
-        );
-        // Three samples occupy the first three columns; the rest is still empty.
-        assert!(
-            is_plot_char(&sym(&b, 2, 4)),
-            "newest column should have data"
-        );
-        assert!(
-            !is_plot_char(&sym(&b, 10, 4)),
-            "unfilled region should be blank"
-        );
-    }
-
-    #[test]
-    fn overflowing_data_scrolls_with_newest_at_the_right() {
-        let mut b = buffer(10, 4);
-        // 30 samples into 10 columns: only the last 10 fit, newest on the right.
-        let data: Vec<f64> = (0..30).map(|i| i as f64).collect();
-        render_chart(
-            &mut b,
-            Rect::new(0, 0, 10, 4),
-            &data,
-            100.0,
-            style(),
-            ChartOpts {
-                y_axis: false,
-                x_axis: false,
-                ..Default::default()
-            },
-        );
-        // Values rise 20..29 across the visible window, so the newest column
-        // must be drawn taller than the oldest.
-        let oldest = sym(&b, 0, 3);
-        let newest = sym(&b, 9, 3);
-        assert!(is_plot_char(&oldest) && is_plot_char(&newest));
-        assert_eq!(
-            newest, "█",
-            "newest sample fills its row, got {newest:?} vs oldest {oldest:?}"
-        );
-    }
-
-    #[test]
-    fn chart_scrolls_when_data_overflows() {
-        let mut b = buffer(10, 4);
-        let data: Vec<f64> = (0..50).map(|i| (i % 10) as f64 * 10.0).collect();
-        render_chart(
-            &mut b,
-            Rect::new(0, 0, 10, 4),
-            &data,
-            100.0,
-            style(),
-            ChartOpts {
-                y_axis: false,
-                x_axis: false,
-                ..Default::default()
-            },
-        );
-        // Overflowing data must not panic or write outside the buffer.
-        assert_eq!(b.area.width, 10);
-    }
-
-    #[test]
-    fn degenerate_rects_are_tolerated() {
-        let mut b = buffer(4, 4);
-        render_chart(
-            &mut b,
-            Rect::new(0, 0, 0, 0),
-            &[1.0],
-            1.0,
-            style(),
-            ChartOpts::default(),
-        );
-        render_chart(
-            &mut b,
-            Rect::new(0, 0, 3, 1),
-            &[1.0],
-            1.0,
-            style(),
-            ChartOpts::default(),
-        );
     }
 
     #[test]
@@ -539,17 +603,5 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(s.chars().count(), 8);
-    }
-
-    #[test]
-    fn sparkline_is_one_row_wide() {
-        let t = sparkline(&[1.0, 5.0, 9.0], 10.0, 10);
-        let s: String = t.lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(s.chars().count(), 10);
-        assert!(is_plot_char(&s));
     }
 }

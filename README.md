@@ -10,10 +10,11 @@ A TUI speed test against Cloudflare's public speed-test endpoints.
 Most terminal speed tests wrap a box-drawing border around a single number.
 This one is built around the graph:
 
-- **Readable charts.** The `▁▂▃▄▅▆▇█` block ramp gives a solid filled curve you
-  can read at a glance, with a labelled value axis and a time axis. (Braille
-  sub-pixels give finer resolution, but they render as texture no human can
-  interpret — so this uses the btop-style block ramp instead.)
+- **Smooth curves.** The chart is drawn on a braille sub-pixel grid (2x4 dots
+  per cell), giving the edge 8x the vertical resolution of a character cell so
+  it traces as a curve instead of stepping. The body beneath is filled on the
+  same grid and graded toward the baseline, with a labelled value axis and time
+  axis so any reading can be checked against the scale.
 - **No bezels.** No cards, borders or boxes. Structure comes from whitespace,
   thin rules and colour weight, so the interface is one continuous surface.
 - **The route, always visible.** The main view states plainly who *you* are and
