@@ -8,16 +8,24 @@ A TUI speed test against Cloudflare's public speed-test endpoints.
 ## Why
 
 Most terminal speed tests wrap a box-drawing border around a single number.
-This one is built around the graph:
+This one is built around the graph, and laid out like a web dashboard:
 
 - **Braille area charts.** Each cell carries 2x4 dots, so the charts have 8x the
   vertical resolution of a character sparkline. Curves read as curves, not
-  staircases.
+  staircases, and they carry a gradient fill.
+- **Cards, not boxes.** Panels are rounded surfaces with their own background
+  and a coloured accent border, borrowed from the Textual/`posting` idiom that
+  treats the terminal like a browser rather than a form.
+- **Metric cards.** Download and upload sit side by side, each with a circular
+  gauge, a headline figure, a meter and its own chart.
+- **Stat tiles.** Idle latency, loaded latency, jitter, packet loss,
+  bufferbloat, stability and DNS resolve into a row of compact tiles, colour
+  graded from `A+` green to `F` red.
 - **Live streaming.** Throughput is sampled every 200ms while the test runs, so
-  you watch the line draw itself instead of waiting for a summary.
-- **No boxes.** Hierarchy comes from colour weight and whitespace, not chrome.
-- **Honest numbers.** Uploads are counted only once the server acknowledges
-  them; a `send()` that resolves on response headers cannot over-count.
+  you watch the chart draw itself instead of waiting for a summary.
+- **Honest numbers.** Uploads are counted only once the socket has taken the
+  bytes, and download requests shrink automatically when Cloudflare starts
+  rate limiting, so the figures mean something.
 
 ## Install
 

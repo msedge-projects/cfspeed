@@ -1,5 +1,9 @@
-//! All rendering. Layout is built from whitespace, rules and colour weight
-//! rather than bordered boxes.
+//! All rendering.
+//!
+//! Layout follows web-dashboard conventions rather than the usual TUI habit of
+//! text floating between box-drawn rules: a top bar surface, two metric cards
+//! side by side, and a row of stat tiles. Panels are rounded surfaces with
+//! their own background, which is the `posting`/Textual idiom.
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,13 +14,20 @@ use ratatui::Frame;
 use crate::app::{App, View};
 use crate::speed::{bufferbloat_grade, cv_percent, median, percentile, stability_grade, Phase};
 use crate::ui::charts::{format_mbps, meter, render_area, ChartStyle};
-use crate::ui::theme::{self, ACCENT_DOWN, ACCENT_UP};
+use crate::ui::theme::{self, ACCENT_DOWN, ACCENT_LAT, ACCENT_UP};
+use crate::ui::widgets::{card, dial, pill, tile_lines};
+
+/// Below this the dashboard cannot breathe, so we degrade to the live view.
+const MIN_WIDTH: u16 = 46;
+const MIN_HEIGHT: u16 = 20;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    if area.width < 24 || area.height < 10 {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
-            Paragraph::new("Terminal too small\nneed at least 24x10"),
+            Paragraph::new(format!(
+                "Terminal too small\nneed at least {MIN_WIDTH}x{MIN_HEIGHT}"
+            )),
             area,
         );
         return;
@@ -25,59 +36,70 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // brand + phase
-            Constraint::Length(1), // tabs + status
-            Constraint::Length(1), // rule
-            Constraint::Min(1),    // body
-            Constraint::Length(1), // rule
-            Constraint::Length(1), // keybinds
+            Constraint::Length(3), // top bar surface
+            Constraint::Length(1), // gap
+            Constraint::Min(1),    // content
+            Constraint::Length(1), // gap
+            Constraint::Length(4), // stat tiles
+            Constraint::Length(1), // gap
+            Constraint::Length(3), // key bar surface
         ])
         .split(area);
 
-    header(frame, rows[0], app);
-    tabs(frame, rows[1], app);
-    frame.render_widget(theme::rule(rows[2].width), rows[2]);
+    top_bar(frame, rows[0], app);
 
     match app.view {
-        View::Live => live(frame, rows[3], app),
-        View::Charts => charts(frame, rows[3], app),
-        View::History => history(frame, rows[3], app),
-        View::Help => help(frame, rows[3], app),
+        View::Live => live(frame, rows[2], app),
+        View::Charts => charts(frame, rows[2], app),
+        View::History => history(frame, rows[2], app),
+        View::Help => help(frame, rows[2], app),
     }
 
-    frame.render_widget(theme::rule(rows[4].width), rows[4]);
-    footer(frame, rows[5], app);
+    stat_tiles(frame, rows[4], app);
+    key_bar(frame, rows[6], app);
 }
 
 // ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
 
-fn header(frame: &mut Frame, area: Rect, app: &App) {
-    let left = Line::from(vec![
-        Span::styled("cfspeed", theme::style_title()),
-        Span::raw("  "),
-        Span::styled(target_line(app), theme::style_dim()),
-    ]);
-    frame.render_widget(Paragraph::new(left), area);
+fn top_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let inner = card(frame, area, theme::ACCENT_DOWN, true);
+    if inner.height == 0 {
+        return;
+    }
+    let line = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(28)])
+        .split(inner);
 
-    let pill = Style::default()
-        .fg(theme::TEXT_BRIGHT)
-        .bg(theme::phase_color(app.phase))
-        .add_modifier(Modifier::BOLD);
+    let brand = Line::from(vec![
+        Span::styled(" cfspeed", theme::style_title()),
+        Span::styled("   ", Style::default()),
+        Span::styled(target_line(app), theme::style_label()),
+    ]);
+    frame.render_widget(Paragraph::new(brand), line[0]);
+
+    let phase = theme::phase_color(app.phase);
     let right = Line::from(vec![
+        Span::styled(
+            format!(" {} ", app.phase.label()),
+            Style::default()
+                .fg(theme::SURFACE)
+                .bg(phase)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("  {}  ", fmt_dur(app.elapsed)),
             Style::default().fg(theme::TEXT),
         ),
-        Span::styled(format!(" {} ", app.phase.label()), pill),
     ]);
-    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), line[1]);
 }
 
 fn target_line(app: &App) -> String {
     if app.hide_info {
-        return "network details hidden   (Shift+H to reveal)".to_string();
+        return "network hidden  (Shift+H)".to_string();
     }
     let mut parts = Vec::new();
     if !app.meta.colo.is_empty() {
@@ -89,9 +111,6 @@ fn target_line(app: &App) -> String {
     if !app.meta.ip.is_empty() {
         parts.push(app.meta.ip.clone());
     }
-    if !app.meta.warp.is_empty() && app.meta.warp != "off" {
-        parts.push(format!("warp {}", app.meta.warp));
-    }
     if parts.is_empty() {
         "connecting…".to_string()
     } else {
@@ -99,54 +118,47 @@ fn target_line(app: &App) -> String {
     }
 }
 
-fn tabs(frame: &mut Frame, area: Rect, app: &App) {
+fn key_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let inner = card(frame, area, theme::ACCENT_DOWN, true);
+    if inner.height == 0 {
+        return;
+    }
+    let line = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(30)])
+        .split(inner);
+
+    // Nav pills.
     let mut spans = Vec::new();
     for (i, v) in View::ALL.iter().enumerate() {
-        let style = if *v == app.view {
-            Style::default()
-                .fg(theme::TEXT_BRIGHT)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            theme::style_dim()
-        };
-        spans.push(Span::styled(format!(" {} ", v.label()), style));
+        spans.push(pill(v.label(), *v == app.view, theme::ACCENT_DOWN));
         if i + 1 < View::ALL.len() {
-            spans.push(Span::raw("   "));
+            spans.push(Span::raw(" "));
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), line[0]);
 
-    let msg: Line = if let Some(e) = &app.error {
-        Line::from(Span::styled(
-            format!("error: {e}"),
-            Style::default().fg(theme::grade_color("F")),
-        ))
-    } else if !app.status.is_empty() {
-        Line::from(Span::styled(app.status.clone(), theme::style_dim()))
-    } else if app.running {
-        Line::from(Span::styled("running…", theme::style_dim()))
-    } else {
-        Line::default()
-    };
-    frame.render_widget(Paragraph::new(msg).alignment(Alignment::Right), area);
-}
-
-fn footer(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![
-        kbd("1-4"),
-        Span::raw(" view   "),
+    let mut keys = vec![
+        kbd("r"),
+        Span::raw(" run  "),
         kbd("Tab"),
-        Span::raw(" cycle   "),
+        Span::raw(" view  "),
     ];
-    if !app.running {
-        spans.push(kbd("r"));
-        spans.push(Span::raw(" run again   "));
+    if let Some(e) = &app.error {
+        keys.push(Span::styled(
+            format!(" error: {e} "),
+            Style::default().fg(theme::grade_color("F")),
+        ));
+    } else {
+        keys.push(kbd("Shift+H"));
+        keys.push(Span::raw(" hide  "));
+        keys.push(kbd("q"));
+        keys.push(Span::raw(" quit"));
     }
-    spans.push(kbd("Shift+H"));
-    spans.push(Span::raw(" privacy   "));
-    spans.push(kbd("q"));
-    spans.push(Span::raw(" quit"));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(keys)).alignment(Alignment::Right),
+        line[1],
+    );
 }
 
 fn kbd(k: &str) -> Span<'static> {
@@ -159,108 +171,233 @@ fn kbd(k: &str) -> Span<'static> {
 }
 
 // ---------------------------------------------------------------------------
+// Stat tiles
+// ---------------------------------------------------------------------------
+
+fn stat_tiles(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width < 10 || area.height < 3 {
+        return;
+    }
+
+    let measuring = app.phase == Phase::Idle || app.running;
+    let (idle, loaded, jitter, loss) = match &app.result {
+        Some(r) => (r.idle.med, r.loaded_down.med, r.idle.jitter, r.idle.loss),
+        None if measuring => (
+            median(&app.probe_samples),
+            0.0,
+            jit(&app.probe_samples),
+            0.0,
+        ),
+        None => (0.0, 0.0, 0.0, 0.0),
+    };
+
+    let mut tiles: Vec<(&str, String, Color)> = Vec::new();
+    if idle > 0.0 {
+        tiles.push(("IDLE", fmt_ms(idle), ACCENT_LAT));
+    }
+    if loaded > 0.0 {
+        tiles.push(("LOADED", fmt_ms(loaded), ACCENT_LAT));
+    }
+    if jitter > 0.0 {
+        tiles.push(("JITTER", fmt_ms(jitter), ACCENT_LAT));
+    }
+    if loss > 0.0 {
+        tiles.push(("LOSS", format!("{loss:.1}%"), theme::grade_color("D")));
+    }
+    if let Some(q) = app.quality() {
+        tiles.push((
+            "BUFFERBLOAT",
+            format!("{}  ({:.0}ms)", q.bufferbloat, q.bufferbloat_ms),
+            theme::grade_color(q.bufferbloat),
+        ));
+        tiles.push((
+            "STABILITY",
+            format!("{}  ({:.0}%)", q.stability, q.stability_cv),
+            theme::grade_color(q.stability),
+        ));
+    }
+    if app.meta.dns_ms > 0.0 {
+        tiles.push(("DNS", fmt_ms(app.meta.dns_ms), theme::TEXT));
+    }
+    if tiles.is_empty() {
+        tiles.push(("STATUS", "measuring…".into(), theme::TEXT_DIM));
+    }
+
+    // Two rows of tiles when they would otherwise be too narrow to read.
+    let count = tiles.len().max(1);
+    let per_row = if area.width / count as u16 >= 18 {
+        count
+    } else {
+        count.div_ceil(2)
+    };
+    let rows: usize = if per_row >= tiles.len() { 1 } else { 2 };
+    let row_height = (area.height / rows as u16).max(1);
+
+    for row in 0..rows {
+        let slice = &tiles[row * per_row..((row + 1) * per_row).min(tiles.len())];
+        if slice.is_empty() {
+            continue;
+        }
+        let row_area = Rect {
+            x: area.x,
+            y: area.y + (row * usize::from(row_height)) as u16,
+            width: area.width,
+            height: row_height,
+        };
+        let widths: Vec<Constraint> = slice
+            .iter()
+            .map(|_| Constraint::Ratio(1, slice.len() as u32))
+            .collect();
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(widths)
+            .split(row_area);
+
+        for (i, (label, value, color)) in slice.iter().enumerate() {
+            let inner = card(frame, cols[i], *color, false);
+            if inner.height == 0 {
+                continue;
+            }
+            frame.render_widget(
+                Paragraph::new(Text::from(tile_lines(label, value.clone(), *color))),
+                inner,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Live view
 // ---------------------------------------------------------------------------
 
 fn live(frame: &mut Frame, area: Rect, app: &App) {
-    let parts = Layout::default()
-        .direction(Direction::Vertical)
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Min(8),
-            Constraint::Min(8),
+            Constraint::Ratio(1, 2),
             Constraint::Length(1),
-            Constraint::Length(2),
+            Constraint::Ratio(1, 2),
         ])
         .split(area);
 
-    phase_panel(
+    phase_card(
         frame,
-        parts[0],
+        cols[0],
+        "↓",
         "DOWNLOAD",
         ACCENT_DOWN,
         &app.down_samples,
         app.down_scaler.value(),
         app.phase == Phase::Download,
     );
-    phase_panel(
+    phase_card(
         frame,
-        parts[1],
+        cols[2],
+        "↑",
         "UPLOAD",
         ACCENT_UP,
         &app.up_samples,
         app.up_scaler.value(),
         app.phase == Phase::Upload,
     );
-    frame.render_widget(stats_strip(app), parts[3]);
 }
 
-/// One phase block: label, headline + meter, chart, summary.
-fn phase_panel(
+#[allow(clippy::too_many_arguments)]
+fn phase_card(
     frame: &mut Frame,
     area: Rect,
+    arrow: &str,
     label: &str,
     color: Color,
     samples: &[f64],
     scale_max: f64,
     active: bool,
 ) {
-    if area.width == 0 || area.height < 4 {
+    if area.width < 20 || area.height < 10 {
         return;
     }
+    let inner = card(frame, area, color, active);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(1), // label
+            Constraint::Length(6), // dial + headline
+            Constraint::Min(1),    // chart
+            Constraint::Length(1), // summary
+        ])
+        .split(inner);
+
+    // 1. Label.
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {arrow} "), Style::default().fg(color)),
+            Span::styled(
+                label.to_string(),
+                Style::default()
+                    .fg(theme::TEXT_BRIGHT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        rows[0],
+    );
+
+    // 2. Dial on the left, headline number and bar on the right.
+    let instant = samples.last().copied().unwrap_or(0.0);
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(10),
+            Constraint::Length(1), // breathing room beside the dial
+            Constraint::Min(1),
+        ])
+        .split(rows[1]);
+
+    dial(
+        frame.buffer_mut(),
+        split[0],
+        instant / scale_max.max(1.0),
+        color,
+        theme::SURFACE_ALT,
+    );
+
+    let info = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
         ])
-        .split(area);
+        .split(split[2]);
 
-    let instant = samples.last().copied().unwrap_or(0.0);
-
-    // 1. Label, with the live instantaneous rate while this phase is active.
-    let label_style = if active {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(theme::TEXT_MUTED)
-            .add_modifier(Modifier::BOLD)
-    };
-    let mut head = vec![Span::styled(format!(" {label}"), label_style)];
-    if active {
-        head.push(Span::styled(
-            format!("   {}", format_mbps(instant)),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(head)), rows[0]);
-
-    // 2. Headline number, then a meter across the remaining width.
     let big_text = fmt_value(instant);
     let unit = unit_for(instant);
-    let mut line = vec![
-        Span::styled(format!(" {big_text}"), theme::style_headline()),
-        Span::styled(format!(" {unit}"), Style::default().fg(theme::TEXT_MUTED)),
-    ];
-    let used = 1 + big_text.len() + 1 + unit.len() + 3;
-    let meter_width = usize::from(rows[1].width).saturating_sub(used);
-    if meter_width > 8 {
-        if let Some(first) = meter(
-            instant / scale_max.max(1.0),
-            meter_width as u16,
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {big_text}"), theme::style_headline()),
+            Span::styled(format!(" {unit}"), Style::default().fg(theme::TEXT_DIM)),
+        ])),
+        info[0],
+    );
+    let (avg, _, _) = sample_stats(samples);
+    let bar_w = usize::from(info[1].width).saturating_sub(1);
+    if bar_w > 4 {
+        if let Some(line) = meter(
+            avg / scale_max.max(1.0),
+            bar_w as u16,
             color,
-            theme::TRACK,
+            theme::SURFACE_ALT,
         )
         .lines
         .into_iter()
         .next()
         {
-            line.push(Span::raw("  "));
-            line.extend(first.spans);
+            frame.render_widget(Paragraph::new(line), info[1]);
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(line)), rows[1]);
 
     // 3. Chart.
     render_area(
@@ -270,85 +407,31 @@ fn phase_panel(
         scale_max,
         ChartStyle {
             fill: color,
-            edge: theme::TEXT_BRIGHT,
-            axis: theme::RULE,
+            edge: theme::CREST,
+            axis: theme::BORDER,
         },
         true,
     );
 
     // 4. Summary.
-    let (avg, p95, max) = sample_stats(samples);
+    let (_, p95, peak) = sample_stats(samples);
     let mut summary = vec![
         Span::styled(" avg ", theme::style_label()),
         Span::styled(format_mbps(avg), Style::default().fg(theme::TEXT)),
-        Span::styled("   p95 ", theme::style_label()),
+        Span::styled("  p95 ", theme::style_label()),
         Span::styled(format_mbps(p95), Style::default().fg(theme::TEXT)),
-        Span::styled("   max ", theme::style_label()),
-        Span::styled(format_mbps(max), Style::default().fg(theme::TEXT)),
-        Span::styled(format!("   {} samples", samples.len()), theme::style_dim()),
+        Span::styled("  max ", theme::style_label()),
+        Span::styled(format_mbps(peak), Style::default().fg(theme::TEXT)),
     ];
     // A full phase that never moved a byte is almost always the endpoint
     // refusing us (HTTP 429), not a genuinely motionless link.
     if samples.len() >= 5 && avg == 0.0 {
         summary.push(Span::styled(
-            "   no data received - endpoint may be rate limiting (HTTP 429)",
+            "  rate limited (429)",
             Style::default().fg(theme::grade_color("D")),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(summary)), rows[3]);
-}
-
-fn stat(label: &str, value: String, style: Style) -> Vec<Span<'static>> {
-    vec![
-        Span::styled(format!(" {label} "), theme::style_label()),
-        Span::styled(format!(" {value}  "), style),
-    ]
-}
-
-fn stats_strip(app: &App) -> Text<'static> {
-    let mut line: Vec<Span<'static>> = Vec::new();
-    let value = Style::default().fg(theme::TEXT);
-
-    let measuring = app.phase == Phase::Idle || app.running;
-    let (idle_med, loaded_med, jitter, loss) = match &app.result {
-        Some(r) => (r.idle.med, r.loaded_down.med, r.idle.jitter, r.idle.loss),
-        None if measuring => (med(&app.probe_samples), 0.0, jit(&app.probe_samples), 0.0),
-        None => (0.0, 0.0, 0.0, 0.0),
-    };
-
-    if idle_med > 0.0 {
-        line.extend(stat("idle", fmt_ms(idle_med), value));
-    }
-    if loaded_med > 0.0 {
-        line.extend(stat("loaded", fmt_ms(loaded_med), value));
-    }
-    if jitter > 0.0 {
-        line.extend(stat("jitter", fmt_ms(jitter), value));
-    }
-    if loss > 0.0 {
-        line.extend(stat(
-            "loss",
-            format!("{loss:.1}%"),
-            Style::default().fg(theme::grade_color("D")),
-        ));
-    }
-    if let Some(q) = app.quality() {
-        line.extend(stat(
-            "bloat",
-            format!("{} ({:.0}ms)", q.bufferbloat, q.bufferbloat_ms),
-            Style::default().fg(theme::grade_color(q.bufferbloat)),
-        ));
-        line.extend(stat(
-            "stability",
-            format!("{} ({:.0}%)", q.stability, q.stability_cv),
-            Style::default().fg(theme::grade_color(q.stability)),
-        ));
-    }
-    if app.meta.dns_ms > 0.0 {
-        line.extend(stat("dns", fmt_ms(app.meta.dns_ms), value));
-    }
-
-    Text::from(Line::from(line))
 }
 
 // ---------------------------------------------------------------------------
@@ -358,68 +441,73 @@ fn stats_strip(app: &App) -> Text<'static> {
 fn charts(frame: &mut Frame, area: Rect, app: &App) {
     let parts = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Min(7), Constraint::Min(6)])
+        .constraints([Constraint::Min(7), Constraint::Min(7), Constraint::Min(5)])
         .split(area);
 
-    big_chart(
-        frame,
-        parts[0],
-        "DOWNLOAD  Mbps",
-        &app.down_samples,
-        app.down_scaler.value(),
-        ACCENT_DOWN,
-    );
-    big_chart(
-        frame,
-        parts[1],
-        "UPLOAD  Mbps",
-        &app.up_samples,
-        app.up_scaler.value(),
-        ACCENT_UP,
-    );
+    for (slot, title, samples, max, color) in [
+        (
+            parts[0],
+            "DOWNLOAD  Mbps",
+            &app.down_samples,
+            app.down_scaler.value(),
+            ACCENT_DOWN,
+        ),
+        (
+            parts[1],
+            "UPLOAD  Mbps",
+            &app.up_samples,
+            app.up_scaler.value(),
+            ACCENT_UP,
+        ),
+        (
+            parts[2],
+            "LATENCY  ms",
+            &scaled(&app.probe_samples, 0.0, 200.0),
+            200.0,
+            ACCENT_LAT,
+        ),
+    ] {
+        let inner = card(frame, slot, color, false);
+        if inner.height < 3 {
+            continue;
+        }
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
 
-    let lat = scaled(&app.probe_samples, 0.0, 200.0);
-    big_chart(frame, parts[2], "LATENCY  ms", &lat, 200.0, Color::Blue);
-}
-
-fn big_chart(frame: &mut Frame, area: Rect, title: &str, samples: &[f64], max: f64, color: Color) {
-    if area.width == 0 || area.height < 2 {
-        return;
+        let (_, p95, peak) = sample_stats(samples);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" {title}"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("   peak {}", format_mbps(peak)),
+                    theme::style_label(),
+                ),
+                Span::styled(format!("   p95 {}", format_mbps(p95)), theme::style_label()),
+                Span::styled(
+                    format!("   {} samples", samples.len()),
+                    theme::style_label(),
+                ),
+            ])),
+            rows[0],
+        );
+        render_area(
+            frame.buffer_mut(),
+            rows[1],
+            samples,
+            max,
+            ChartStyle {
+                fill: color,
+                edge: theme::CREST,
+                axis: theme::BORDER,
+            },
+            true,
+        );
     }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
-
-    let (_, p95, peak) = sample_stats(samples);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {title}"),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("    peak {}", format_mbps(peak)),
-                theme::style_dim(),
-            ),
-            Span::styled(format!("    p95 {}", format_mbps(p95)), theme::style_dim()),
-            Span::styled(format!("    {} samples", samples.len()), theme::style_dim()),
-        ])),
-        rows[0],
-    );
-
-    render_area(
-        frame.buffer_mut(),
-        rows[1],
-        samples,
-        max,
-        ChartStyle {
-            fill: color,
-            edge: theme::TEXT_BRIGHT,
-            axis: theme::RULE,
-        },
-        true,
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -427,10 +515,14 @@ fn big_chart(frame: &mut Frame, area: Rect, title: &str, samples: &[f64], max: f
 // ---------------------------------------------------------------------------
 
 fn history(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width < 20 || area.height < 6 {
+        return;
+    }
+    let inner = card(frame, area, theme::ACCENT_DOWN, false);
     if app.history.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("  No saved runs yet.", theme::style_dim()),
+                Span::styled("  No saved runs yet.", theme::style_label()),
                 Span::raw("\n\n  Press "),
                 Span::styled(
                     " r ",
@@ -438,17 +530,17 @@ fn history(frame: &mut Frame, area: Rect, app: &App) {
                         .fg(theme::TEXT_BRIGHT)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" to run a test.", theme::style_dim()),
+                Span::styled(" to run a test.", theme::style_label()),
             ])),
-            area,
+            inner,
         );
         return;
     }
 
     let parts = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(8)])
-        .split(area);
+        .constraints([Constraint::Min(4), Constraint::Length(8)])
+        .split(inner);
 
     let mut lines = vec![Line::from(vec![
         header_col("TIME", 17),
@@ -471,17 +563,14 @@ fn history(frame: &mut Frame, area: Rect, app: &App) {
     for (idx, run) in app.history.iter().enumerate().skip(start).take(rows_avail) {
         let selected = idx == app.history_sel;
         let base = if selected {
-            Style::default()
-                .fg(theme::TEXT_BRIGHT)
-                .add_modifier(Modifier::REVERSED)
+            Style::default().fg(theme::SURFACE).bg(theme::TEXT_BRIGHT)
         } else {
             Style::default().fg(theme::TEXT)
         };
         let q_bloat = bufferbloat_grade(run.bufferbloat_ms());
         let cv = cv_percent(&run.upload.samples).max(cv_percent(&run.download.samples));
         let q_stab = stability_grade(cv);
-
-        let style_for = |grade: &str| {
+        let styled = |grade: &str| {
             if selected {
                 base
             } else {
@@ -496,16 +585,15 @@ fn history(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(col_padded(&fmt_ms(run.idle.med), 8), base),
             Span::styled(col_padded(&fmt_ms(run.idle.jitter), 8), base),
             Span::styled(col_padded(&format!("{:.1}%", run.idle.loss), 7), base),
-            Span::styled(col_padded(q_bloat, 7), style_for(q_bloat)),
-            Span::styled(col_padded(q_stab, 6), style_for(q_stab)),
+            Span::styled(col_padded(q_bloat, 7), styled(q_bloat)),
+            Span::styled(col_padded(q_stab, 6), styled(q_stab)),
         ]));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), parts[0]);
 
-    // Trend across saved runs.
     let downs: Vec<f64> = app.history.iter().map(|r| r.download.avg).collect();
     let peak = (downs.iter().copied().fold(0.0_f64, f64::max) * 1.12).max(1.0);
-    let trend_rows = Layout::default()
+    let trend = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(parts[1]);
@@ -516,17 +604,17 @@ fn history(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(ACCENT_DOWN)
                 .add_modifier(Modifier::BOLD),
         )),
-        trend_rows[0],
+        trend[0],
     );
     render_area(
         frame.buffer_mut(),
-        trend_rows[1],
+        trend[1],
         &downs,
         peak,
         ChartStyle {
             fill: ACCENT_DOWN,
-            edge: theme::TEXT_BRIGHT,
-            axis: theme::RULE,
+            edge: theme::CREST,
+            axis: theme::BORDER,
         },
         false,
     );
@@ -549,6 +637,10 @@ fn col_padded(text: &str, width: usize) -> String {
 // ---------------------------------------------------------------------------
 
 fn help(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width < 20 || area.height < 6 {
+        return;
+    }
+    let inner = card(frame, area, ACCENT_DOWN, false);
     let bindings: Vec<(&str, &str)> = vec![
         ("q / Esc", "quit"),
         ("r", "run a new test"),
@@ -569,7 +661,7 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
                 format!("  {k:<16}"),
                 Style::default().fg(theme::TEXT_BRIGHT),
             ),
-            Span::styled(d.to_string(), theme::style_dim()),
+            Span::styled(d.to_string(), theme::style_label()),
         ]));
     }
     lines.extend([
@@ -578,24 +670,23 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
         Line::default(),
         Line::from(Span::styled(
             "  Measures against Cloudflare's public speed-test endpoints.",
-            theme::style_dim(),
+            theme::style_label(),
         )),
         Line::from(Span::styled(
             "  Throughput is sampled every 200ms and drawn as a braille area",
-            theme::style_dim(),
+            theme::style_label(),
         )),
         Line::from(Span::styled(
             "  chart - 8x the vertical resolution of a character sparkline.",
-            theme::style_dim(),
+            theme::style_label(),
         )),
         Line::default(),
         Line::from(Span::styled(
             format!("  {} saved run(s) in history", app.history.len()),
-            theme::style_dim(),
+            theme::style_label(),
         )),
     ]);
-
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -674,10 +765,6 @@ fn sample_stats(samples: &[f64]) -> (f64, f64, f64) {
     )
 }
 
-fn med(samples: &[f64]) -> f64 {
-    median(samples)
-}
-
 fn jit(samples: &[f64]) -> f64 {
     if samples.len() < 2 {
         return 0.0;
@@ -706,11 +793,9 @@ mod tests {
 
     #[test]
     fn timestamp_formats_as_date_and_clock() {
-        // 1970-01-01T09:14:56Z
-        assert_eq!(fmt_time(33_296_000), "1970-01-01  09:14");
+        assert_eq!(fmt_time(0), "1970-01-01  00:00");
         // 2026-10-11T00:00:00Z - 20737 days after the epoch.
         assert_eq!(fmt_time(1_791_676_800_000), "2026-10-11  00:00");
-        assert_eq!(fmt_time(0), "1970-01-01  00:00");
     }
 
     #[test]

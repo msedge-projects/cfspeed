@@ -13,6 +13,8 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
+use crate::ui::theme;
+
 /// Bit for the braille dot at sub-column `sx` (0=left, 1=right) and sub-row
 /// `sy` (0=top .. 3=bottom).
 ///
@@ -153,9 +155,9 @@ pub fn render_area(
         })
         .collect();
 
-    let fill_style = Style::default().fg(style.fill);
     let edge_style = Style::default().fg(style.edge).add_modifier(Modifier::BOLD);
     let grid_style = Style::default().fg(style.axis);
+    let sub_height_f = sub_height as f64;
 
     // A single midline reads cleaner than a dense set of rules behind the curve.
     let midline = usize::from(area.height) / 2;
@@ -186,7 +188,19 @@ pub fn render_area(
             if fill_bits != 0 {
                 let is_edge = edge_bits != 0;
                 cell.set_symbol(braille_cell(col_levels).encode_utf8(&mut [0u8; 4]));
-                cell.set_style(if is_edge { edge_style } else { fill_style });
+                if is_edge {
+                    cell.set_style(edge_style);
+                } else {
+                    // Gradient: colour deepens toward the crest so a tall bar
+                    // reads as lit from above rather than flat.
+                    let lit = lit[cx * 2].max(lit[cx * 2 + 1]);
+                    let t = (f64::from(lit) / sub_height_f).clamp(0.0, 1.0);
+                    cell.set_style(Style::default().fg(theme::blend(
+                        theme::SURFACE,
+                        style.fill,
+                        t,
+                    )));
+                }
             } else if grid_row {
                 cell.set_symbol("·");
                 cell.set_style(grid_style);
