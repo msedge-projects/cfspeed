@@ -518,30 +518,48 @@ async fn upload_worker(
 ) {
     use bytes::Bytes;
     use rand::RngCore;
+    use std::sync::atomic::AtomicUsize;
 
-    // A *finite* body per request. `send()` resolves as soon as response
-    // headers arrive, so an endless stream would be abandoned mid-flight and
-    // restarted, crediting bytes the server never received. Sending a fixed
-    // chunk and counting only on a successful response keeps the figure honest.
-    const CHUNK: usize = 25_000_000;
+    // Each request sends a *finite* body: `send()` resolves on response headers,
+    // so an endless stream would be abandoned mid-flight and restarted,
+    // crediting bytes the server never received.
+    //
+    // The body is still streamed in chunks rather than handed over as one
+    // blob, so the byte counter advances at roughly socket pace and the
+    // sampled curve stays smooth instead of stepping by 25MB per request.
+    const CHUNK: usize = 250 * 1024;
+    const CHUNKS: usize = 100; // 25MB per request
 
     let payload: Bytes = {
         let mut v = vec![0u8; CHUNK];
         rand::thread_rng().fill_bytes(&mut v);
         // `Bytes::from(Vec)` takes ownership without copying; cloning per
-        // request is just a refcount bump.
+        // chunk is just a refcount bump.
         Bytes::from(v)
     };
     let chunk_len = payload.len() as u64;
     let url = format!("{base_url}/__up");
 
     while Instant::now() < deadline {
-        match client.post(&url).body(payload.clone()).send().await {
-            Ok(resp) if resp.status().is_success() => {
+        let remaining = Arc::new(AtomicUsize::new(CHUNKS));
+        let shared = payload.clone();
+        let shared_counter = Arc::clone(&counter);
+        let stream = futures::stream::unfold((), move |()| {
+            let payload = shared.clone();
+            let counter = Arc::clone(&shared_counter);
+            let remaining = Arc::clone(&remaining);
+            async move {
+                if remaining.fetch_sub(1, Ordering::SeqCst) == 0 {
+                    return None;
+                }
                 counter.fetch_add(chunk_len, Ordering::Relaxed);
+                Some((Ok::<Bytes, std::io::Error>(payload), ()))
             }
-            Ok(_) => {}
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        });
+        let body = reqwest::Body::wrap_stream(stream);
+        if let Err(e) = client.post(&url).body(body).send().await {
+            let _ = e;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 }

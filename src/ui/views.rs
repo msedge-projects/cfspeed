@@ -278,18 +278,24 @@ fn phase_panel(
 
     // 4. Summary.
     let (avg, p95, max) = sample_stats(samples);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" avg ", theme::style_label()),
-            Span::styled(format_mbps(avg), Style::default().fg(theme::TEXT)),
-            Span::styled("   p95 ", theme::style_label()),
-            Span::styled(format_mbps(p95), Style::default().fg(theme::TEXT)),
-            Span::styled("   max ", theme::style_label()),
-            Span::styled(format_mbps(max), Style::default().fg(theme::TEXT)),
-            Span::styled(format!("   {} samples", samples.len()), theme::style_dim()),
-        ])),
-        rows[3],
-    );
+    let mut summary = vec![
+        Span::styled(" avg ", theme::style_label()),
+        Span::styled(format_mbps(avg), Style::default().fg(theme::TEXT)),
+        Span::styled("   p95 ", theme::style_label()),
+        Span::styled(format_mbps(p95), Style::default().fg(theme::TEXT)),
+        Span::styled("   max ", theme::style_label()),
+        Span::styled(format_mbps(max), Style::default().fg(theme::TEXT)),
+        Span::styled(format!("   {} samples", samples.len()), theme::style_dim()),
+    ];
+    // A full phase that never moved a byte is almost always the endpoint
+    // refusing us (HTTP 429), not a genuinely motionless link.
+    if samples.len() >= 5 && avg == 0.0 {
+        summary.push(Span::styled(
+            "   no data received - endpoint may be rate limiting (HTTP 429)",
+            Style::default().fg(theme::grade_color("D")),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(summary)), rows[3]);
 }
 
 fn stat(label: &str, value: String, style: Style) -> Vec<Span<'static>> {
