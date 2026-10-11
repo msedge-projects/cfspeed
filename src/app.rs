@@ -42,7 +42,7 @@ impl Action {
             Action::ExportJson => "writes cfspeed-history.json",
             Action::ExportCsv => "writes cfspeed-history.csv",
             Action::ClearHistory => "removes every saved run",
-            Action::ToggleChartEdge => "4 steps per cell, dotted edge",
+            Action::ToggleChartEdge => "braille edge, 4 steps per cell",
         }
     }
 
@@ -228,7 +228,7 @@ impl App {
             error: None,
             restart: false,
             quit: false,
-            smooth_charts: true,
+            smooth_charts: false,
             generation: 0,
         }
     }
@@ -880,23 +880,23 @@ mod tests {
     #[test]
     fn the_edge_style_toggles_and_the_menu_offers_the_other_one() {
         let mut a = app();
-        assert!(a.smooth_charts, "smooth is the default");
-        assert_eq!(
-            Action::edge_label(a.smooth_charts),
-            "Chart edge: solid",
-            "the menu should offer the switch to solid"
-        );
-
-        a.run_action(Action::ToggleChartEdge);
-        assert!(!a.smooth_charts);
+        assert!(!a.smooth_charts, "the solid line is the default");
         assert_eq!(
             Action::edge_label(a.smooth_charts),
             "Chart edge: smooth",
-            "the menu should offer the switch back to smooth"
+            "the menu should offer the switch to smooth"
         );
 
         a.run_action(Action::ToggleChartEdge);
         assert!(a.smooth_charts);
+        assert_eq!(
+            Action::edge_label(a.smooth_charts),
+            "Chart edge: solid",
+            "the menu should offer the switch back to solid"
+        );
+
+        a.run_action(Action::ToggleChartEdge);
+        assert!(!a.smooth_charts, "toggling twice returns to the default");
         assert!(
             MENU.contains(&Action::ToggleChartEdge),
             "the toggle must be reachable from the palette"

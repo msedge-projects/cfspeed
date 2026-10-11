@@ -285,21 +285,23 @@ pub fn render_chart(
             // the curve stops reading as a curve. Keeping the tint light lets
             // the eye follow the stroke instead, which is the part that is
             // drawn at full resolution.
-            let body = if opts.smooth {
-                let depth = (cy - crest_row) as f64;
-                let span = h.saturating_sub(crest_row).max(1) as f64;
-                let k = 0.34 * (1.0 - depth / span) + 0.07;
-                // Quantise the ramp. A per-row gradient spans the full range in
-                // as many steps as there are rows, and each one lands as a hard
-                // edge, which reads as stripes across the fill rather than as
-                // depth. Few wide steps blend into each other.
-                const FILL_STEPS: f64 = 4.0;
-                let k = (k * FILL_STEPS).round() / FILL_STEPS;
-                theme::blend(theme::SURFACE, style.fill, k)
-            } else {
-                let t = cy as f64 / h.max(1) as f64;
-                theme::blend(theme::SURFACE, style.fill, 0.40 + (1.0 - t) * 0.30)
-            };
+            // The fill is an area gradient: barely there where it meets the
+            // line, saturating toward the baseline. Running the ramp the other
+            // way - heaviest at the crest - makes the chart read as a solid
+            // slab with a pale foot, which is the opposite of how a web chart
+            // is shaded and looks like a bar chart rather than an area.
+            // saturating: in solid mode a crest cell whose curve lands on an odd
+            // sub-row sits above crest_row, since that cell is drawn as the
+            // lower half-block rather than counted as fill.
+            let depth = cy.saturating_sub(crest_row) as f64;
+            let span = h.saturating_sub(crest_row).max(1) as f64;
+            let k = 0.05 + 0.50 * (depth / span);
+            // Quantise the ramp. A per-row gradient spans the full range in as
+            // many steps as there are rows, and each one lands as a hard edge,
+            // which reads as stripes rather than as depth.
+            const FILL_STEPS: f64 = 6.0;
+            let k = (k * FILL_STEPS).round() / FILL_STEPS;
+            let body = theme::blend(theme::SURFACE, style.fill, k);
 
             if opts.smooth && cy > crest_row {
                 // Below the crest cell the area is solid background. Only the
@@ -696,5 +698,35 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(s.chars().count(), 8);
+    }
+
+    /// Odd sub-rows once made the fill depth underflow and panicked the app
+    /// mid-run. Both edge styles are swept here across many heights and widths,
+    /// because the crash only showed up on values that happened to land on an
+    /// odd sub-row at a particular chart height.
+    #[test]
+    fn every_edge_style_survives_every_sub_row_alignment() {
+        for smooth in [false, true] {
+            for h in 1u16..=14 {
+                for w in 1u16..=20 {
+                    // A sawtooth crosses every sub-row alignment in turn.
+                    let data: Vec<f64> = (0..40).map(|i| (i % 7) as f64 * 13.0).collect();
+                    let mut b = buffer(w, h);
+                    render_chart(
+                        &mut b,
+                        Rect::new(0, 0, w, h),
+                        &data,
+                        100.0,
+                        style(),
+                        ChartOpts {
+                            y_axis: false,
+                            x_axis: false,
+                            smooth,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
     }
 }
