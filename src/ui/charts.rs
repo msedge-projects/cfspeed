@@ -208,8 +208,8 @@ pub fn render_chart(
     };
 
     let mut prev: Option<usize> = None;
-    for c in 0..sub_w {
-        let Some(y) = ys[c] else { continue };
+    for (c, slot) in ys.iter().enumerate().take(sub_w) {
+        let Some(y) = *slot else { continue };
         match prev {
             // Bridge the vertical gap so a steep step is a continuous stroke
             // rather than two disconnected dots.
@@ -474,7 +474,7 @@ mod tests {
             .map(|x| {
                 (0..8)
                     .find(|y| is_dot(&sym(&b, x as u16, *y as u16)))
-                    .map(|y| y as i32)
+                    .map(i32::from)
                     .unwrap_or(-1)
             })
             .collect();
