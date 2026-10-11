@@ -8,19 +8,17 @@ A TUI speed test against Cloudflare's public speed-test endpoints.
 ## Why
 
 Most terminal speed tests wrap a box-drawing border around a single number.
-This one is built around the graph, and laid out like a web dashboard:
+This one is built around the graph:
 
-- **Braille area charts.** Each cell carries 2x4 dots, so the charts have 8x the
-  vertical resolution of a character sparkline. Curves read as curves, not
-  staircases, and they carry a gradient fill.
-- **Cards, not boxes.** Panels are rounded surfaces with their own background
-  and a coloured accent border, borrowed from the Textual/`posting` idiom that
-  treats the terminal like a browser rather than a form.
-- **Metric cards.** Download and upload sit side by side, each with a circular
-  gauge, a headline figure, a meter and its own chart.
-- **Stat tiles.** Idle latency, loaded latency, jitter, packet loss,
-  bufferbloat, stability and DNS resolve into a row of compact tiles, colour
-  graded from `A+` green to `F` red.
+- **Readable charts.** The `▁▂▃▄▅▆▇█` block ramp gives a solid filled curve you
+  can read at a glance, with a labelled value axis and a time axis. (Braille
+  sub-pixels give finer resolution, but they render as texture no human can
+  interpret — so this uses the btop-style block ramp instead.)
+- **No bezels.** No cards, borders or boxes. Structure comes from whitespace,
+  thin rules and colour weight, so the interface is one continuous surface.
+- **The route, always visible.** The main view states plainly who *you* are and
+  what *node* you measured against — public IP, ISP, ASN and location on one
+  line, Cloudflare edge code and its addresses on the next.
 - **Live streaming.** Throughput is sampled every 200ms while the test runs, so
   you watch the chart draw itself instead of waiting for a summary.
 - **Honest numbers.** Uploads are counted only once the socket has taken the
@@ -76,6 +74,7 @@ coefficient of variation), graded waveform-style from `A+` to `F`.
 | `+` `-` | zoom the chart time window |
 | `1` `2` `3` `4` | live · charts · details · history |
 | `Tab` `←` `→` | cycle views |
+| **mouse** | click a tab to switch view |
 | `r` | run again |
 | `↑` `↓` | move history selection |
 | `Shift+H` | redact network details |
@@ -83,11 +82,15 @@ coefficient of variation), graded waveform-style from `A+` to `F`.
 
 ## Design notes
 
-The palette is deliberately desaturated rather than the saturated cyan/magenta
-that generic dashboards default to, because these colours sit on screen for the
-length of a test. Every text token is validated against WCAG AA (4.5:1) on both
-surfaces by `tools/contrast_check.py`; active borders use an accent that clears
-7:1, and quiet borders are decorative only.
+The palette is **Tokyo Night**, taken from btop's own shipped theme
+(`themes/tokyo-night.theme`) rather than invented — background `#1a1b26`, cyan
+`#7dcfff` for accents, and the green → orange → red ramp btop uses for its
+meters. Using a palette that already ships inside a tool people trust beats
+picking colours by eye.
+
+Every text token is validated against WCAG AA (4.5:1) on both surfaces by
+`tools/contrast_check.py`, which also guards the exact hex values in a unit test
+so the palette cannot silently drift from the report.
 
 ## Build
 

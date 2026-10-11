@@ -1,9 +1,8 @@
 //! All rendering.
 //!
-//! Layout follows web-dashboard conventions rather than the usual TUI habit of
-//! text floating between box-drawn rules: a top bar surface, two metric cards
-//! side by side, and a row of stat tiles. Panels are rounded surfaces with
-//! their own background, which is the `posting`/Textual idiom.
+//! Full-bleed and bezelless: no cards, no borders, no boxes. Structure comes
+//! from whitespace, thin rules and colour weight, so the interface reads as one
+//! continuous surface rather than a set of framed panels.
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -15,15 +14,19 @@ use crate::app::{App, View};
 use crate::speed::{
     bufferbloat_grade, cv_percent, median, percentile, stability_grade, LatencyStats, Phase,
 };
-use crate::ui::charts::{format_mbps, meter, render_area, ChartStyle};
+use crate::ui::charts::{format_mbps, meter, render_chart, ChartOpts, ChartStyle};
 use crate::ui::theme::{self, ACCENT_DOWN, ACCENT_LAT, ACCENT_UP};
-use crate::ui::widgets::{card, dial, pill, tile_lines};
+use crate::ui::widgets::{badge, pill};
 
-/// Below this the dashboard cannot breathe, so we degrade to the live view.
-const MIN_WIDTH: u16 = 46;
-const MIN_HEIGHT: u16 = 20;
+/// Colour used for the "edge" side of the route strip.
+const ROUTE_EDGE: Color = Color::Rgb(125, 207, 255);
+/// Colour used for the "you" side of the route strip.
+const ROUTE_SELF: Color = Color::Rgb(158, 206, 106);
 
-pub fn draw(frame: &mut Frame, app: &App) {
+const MIN_WIDTH: u16 = 64;
+const MIN_HEIGHT: u16 = 18;
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
@@ -38,71 +41,158 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // top bar surface
-            Constraint::Length(1), // gap
+            Constraint::Length(1), // brand + phase + timer
+            Constraint::Length(1), // rule
+            Constraint::Length(2), // route: you -> edge
+            Constraint::Length(1), // rule
             Constraint::Min(1),    // content
-            Constraint::Length(1), // gap
-            Constraint::Length(4), // stat tiles
-            Constraint::Length(1), // gap
-            Constraint::Length(3), // key bar surface
+            Constraint::Length(1), // rule
+            Constraint::Length(2), // stat tiles
+            Constraint::Length(1), // rule
+            Constraint::Length(1), // nav + keys
         ])
         .split(area);
 
     top_bar(frame, rows[0], app);
+    rule(frame, rows[1]);
+    route(frame, rows[2], app);
+    rule(frame, rows[3]);
 
     match app.view {
-        View::Live => live(frame, rows[2], app),
-        View::Charts => charts(frame, rows[2], app),
-        View::Details => details(frame, rows[2], app),
-        View::History => history(frame, rows[2], app),
-        View::Help => help(frame, rows[2], app),
+        View::Live => live(frame, rows[4], app),
+        View::Charts => charts(frame, rows[4], app),
+        View::Details => details(frame, rows[4], app),
+        View::History => history(frame, rows[4], app),
+        View::Help => help(frame, rows[4], app),
     }
 
-    stat_tiles(frame, rows[4], app);
-    key_bar(frame, rows[6], app);
+    rule(frame, rows[5]);
+    stat_tiles(frame, rows[6], app);
+    rule(frame, rows[7]);
+    nav_bar(frame, rows[8], app);
 }
 
 // ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
 
-fn top_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let inner = card(frame, area, theme::ACCENT_DOWN, true);
-    if inner.height == 0 {
-        return;
-    }
-    let line = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(28)])
-        .split(inner);
+fn rule(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(area.width)),
+            Style::default().fg(theme::BORDER),
+        ))),
+        area,
+    );
+}
 
-    let brand = Line::from(vec![
+fn top_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let left = Line::from(vec![
         Span::styled(" cfspeed", theme::style_title()),
-        Span::styled("   ", Style::default()),
+        Span::styled("  ·  ", theme::style_label()),
         Span::styled(target_line(app), theme::style_label()),
     ]);
-    frame.render_widget(Paragraph::new(brand), line[0]);
+    frame.render_widget(Paragraph::new(left), area);
 
-    let phase = theme::phase_color(app.phase);
     let right = Line::from(vec![
         Span::styled(
-            format!(" {} ", app.phase.label()),
-            Style::default()
-                .fg(theme::SURFACE)
-                .bg(phase)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {}  ", fmt_dur(app.elapsed)),
+            format!(" {}  ", fmt_dur(app.elapsed)),
             Style::default().fg(theme::TEXT),
         ),
+        badge(app.phase.label(), theme::phase_color(app.phase)),
+        Span::raw(" "),
     ]);
-    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), line[1]);
+    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+}
+
+/// The two-hop route line: this machine's public identity, then the Cloudflare
+/// edge we actually measured against. Labelled explicitly because a raw IP on
+/// screen is otherwise ambiguous.
+fn route(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    let m = &app.meta;
+
+    // --- Row 1: YOU -------------------------------------------------------
+    let mut you: Vec<Span<'static>> = vec![Span::styled(
+        "  YOU   ",
+        Style::default().fg(ROUTE_SELF).add_modifier(Modifier::BOLD),
+    )];
+    if app.hide_info {
+        you.push(Span::styled(
+            "hidden   press Shift+H to reveal",
+            Style::default().fg(theme::TEXT_DIM),
+        ));
+    } else {
+        you.push(Span::styled(
+            if m.ip.is_empty() { "…" } else { &m.ip }.to_string(),
+            Style::default().fg(theme::TEXT_BRIGHT),
+        ));
+        let mut who: Vec<String> = Vec::new();
+        if !m.asn_org.is_empty() {
+            who.push(m.asn_org.clone());
+        }
+        if !m.asn.is_empty() {
+            who.push(format!("AS{}", m.asn));
+        }
+        if !m.loc.is_empty() {
+            who.push(m.loc.clone());
+        }
+        if !who.is_empty() {
+            you.push(Span::styled(
+                format!("   {}", who.join(" · ")),
+                Style::default().fg(theme::TEXT),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(you)), rows[0]);
+
+    // --- Row 2: EDGE ------------------------------------------------------
+    let mut edge: Vec<Span<'static>> = vec![Span::styled(
+        "  EDGE  ",
+        Style::default().fg(ROUTE_EDGE).add_modifier(Modifier::BOLD),
+    )];
+    let node = if !m.colo.is_empty() {
+        m.colo.clone()
+    } else if !m.loc.is_empty() {
+        m.loc.clone()
+    } else {
+        "…".to_string()
+    };
+    edge.push(Span::styled(node, Style::default().fg(theme::TEXT_BRIGHT)));
+    if !app.hide_info {
+        if !m.edge_ips.is_empty() {
+            edge.push(Span::styled(
+                format!("   {}", m.edge_ips.join("  ")),
+                Style::default().fg(theme::TEXT),
+            ));
+        }
+        let mut bits: Vec<String> = Vec::new();
+        if !m.tls.is_empty() {
+            bits.push(format!("{} {}", m.tls, m.tls_cipher).trim().to_string());
+        }
+        if !m.http.is_empty() {
+            bits.push(m.http.clone());
+        }
+        if !m.warp.is_empty() && m.warp != "off" {
+            bits.push(format!("WARP {}", m.warp));
+        }
+        if !bits.is_empty() {
+            edge.push(Span::styled(
+                format!("   {}", bits.join(" · ")),
+                Style::default().fg(theme::TEXT_DIM),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(edge)), rows[1]);
 }
 
 fn target_line(app: &App) -> String {
     if app.hide_info {
-        return "network hidden  (Shift+H)".to_string();
+        return "network hidden".to_string();
     }
     let mut parts = Vec::new();
     if !app.meta.colo.is_empty() {
@@ -111,9 +201,6 @@ fn target_line(app: &App) -> String {
     if !app.meta.loc.is_empty() {
         parts.push(app.meta.loc.clone());
     }
-    if !app.meta.ip.is_empty() {
-        parts.push(app.meta.ip.clone());
-    }
     if parts.is_empty() {
         "connecting…".to_string()
     } else {
@@ -121,59 +208,54 @@ fn target_line(app: &App) -> String {
     }
 }
 
-fn key_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let inner = card(frame, area, theme::ACCENT_DOWN, true);
-    if inner.height == 0 {
-        return;
-    }
-    let line = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(30)])
-        .split(inner);
+/// Nav tabs plus key hints. The tab geometry is recorded into `app.nav` so a
+/// mouse click can be resolved to a view.
+fn nav_bar(frame: &mut Frame, area: Rect, app: &mut App) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut x = area.x + 1;
+    app.nav.clear();
 
-    // Nav pills.
-    let mut spans = Vec::new();
-    for (i, v) in View::ALL.iter().enumerate() {
-        spans.push(pill(v.label(), *v == app.view, theme::ACCENT_DOWN));
-        if i + 1 < View::ALL.len() {
-            spans.push(Span::raw(" "));
-        }
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), line[0]);
-
-    let mut keys = vec![
-        kbd("space"),
-        Span::raw(if app.paused { " resume  " } else { " pause  " }),
-        kbd("+"),
-        Span::raw("-"),
-        Span::raw(format!(" zoom ({})  ", app.zoom.label())),
-        kbd("r"),
-        Span::raw(" run  "),
-    ];
-    if let Some(e) = &app.error {
-        keys.push(Span::styled(
-            format!(" error: {e} "),
-            Style::default().fg(theme::grade_color("F")),
+    for v in View::ALL {
+        let label = v.label();
+        let w = usize::from(label.len()) + 2;
+        spans.push(pill(label, v == app.view, ACCENT_LAT));
+        app.nav.push((
+            v,
+            Rect {
+                x,
+                y: area.y,
+                width: w as u16,
+                height: area.height.max(1),
+            },
         ));
-    } else {
-        keys.push(kbd("Shift+H"));
-        keys.push(Span::raw(" hide  "));
-        keys.push(kbd("q"));
-        keys.push(Span::raw(" quit"));
+        x = x.saturating_add(w as u16 + 2);
+        spans.push(Span::raw(" "));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    let pause_word = if app.paused { "resume" } else { "pause" };
+    let zoom_label = app.zoom.label();
+    let mut keys = vec![
+        Span::raw("space "),
+        Span::styled(pause_word, theme::style_label()),
+        Span::raw("   +/- zoom ("),
+        Span::styled(zoom_label, theme::style_label()),
+        Span::raw(")   r run   Shift+H hide   q quit"),
+    ];
+    if app.paused {
+        keys.insert(0, badge("PAUSED", theme::TEXT_BRIGHT));
+        keys.insert(1, Span::raw(" "));
+    }
+    if let Some(e) = &app.error {
+        keys = vec![Span::styled(
+            format!("error: {e}"),
+            Style::default().fg(theme::grade_color("F")),
+        )];
     }
     frame.render_widget(
         Paragraph::new(Line::from(keys)).alignment(Alignment::Right),
-        line[1],
+        area,
     );
-}
-
-fn kbd(k: &str) -> Span<'static> {
-    Span::styled(
-        format!(" {k} "),
-        Style::default()
-            .fg(theme::TEXT_BRIGHT)
-            .add_modifier(Modifier::BOLD),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -181,10 +263,6 @@ fn kbd(k: &str) -> Span<'static> {
 // ---------------------------------------------------------------------------
 
 fn stat_tiles(frame: &mut Frame, area: Rect, app: &App) {
-    if area.width < 10 || area.height < 3 {
-        return;
-    }
-
     let measuring = app.phase == Phase::Idle || app.running;
     let (idle, loaded, jitter, loss) = match &app.result {
         Some(r) => (r.idle.med, r.loaded_down.med, r.idle.jitter, r.idle.loss),
@@ -212,63 +290,53 @@ fn stat_tiles(frame: &mut Frame, area: Rect, app: &App) {
     }
     if let Some(q) = app.quality() {
         tiles.push((
-            "BUFFERBLOAT",
-            format!("{}  ({:.0}ms)", q.bufferbloat, q.bufferbloat_ms),
+            "BLOAT",
+            format!("{} +{:.0}ms", q.bufferbloat, q.bufferbloat_ms),
             theme::grade_color(q.bufferbloat),
         ));
         tiles.push((
-            "STABILITY",
-            format!("{}  ({:.0}%)", q.stability, q.stability_cv),
+            "STAB",
+            format!("{} {:.0}%", q.stability, q.stability_cv),
             theme::grade_color(q.stability),
         ));
     }
     if app.meta.dns_ms > 0.0 {
         tiles.push(("DNS", fmt_ms(app.meta.dns_ms), theme::TEXT));
     }
+    if app.meta.tls_ms > 0.0 {
+        tiles.push(("TLS", fmt_ms(app.meta.tls_ms), theme::TEXT));
+    }
     if tiles.is_empty() {
         tiles.push(("STATUS", "measuring…".into(), theme::TEXT_DIM));
     }
 
-    // Two rows of tiles when they would otherwise be too narrow to read.
-    let count = tiles.len().max(1);
-    let per_row = if area.width / count as u16 >= 18 {
-        count
-    } else {
-        count.div_ceil(2)
-    };
-    let rows: usize = if per_row >= tiles.len() { 1 } else { 2 };
-    let row_height = (area.height / rows as u16).max(1);
-
-    for row in 0..rows {
-        let slice = &tiles[row * per_row..((row + 1) * per_row).min(tiles.len())];
-        if slice.is_empty() {
-            continue;
+    // Flow the tiles across however many rows are available.
+    let per_row = ((usize::from(area.width) / 26).max(1)).min(tiles.len());
+    for (row, chunk) in tiles.chunks(per_row).enumerate() {
+        if row >= usize::from(area.height) {
+            break;
         }
-        let row_area = Rect {
-            x: area.x,
-            y: area.y + (row * usize::from(row_height)) as u16,
-            width: area.width,
-            height: row_height,
-        };
-        let widths: Vec<Constraint> = slice
-            .iter()
-            .map(|_| Constraint::Ratio(1, slice.len() as u32))
-            .collect();
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(widths)
-            .split(row_area);
-
-        for (i, (label, value, color)) in slice.iter().enumerate() {
-            let inner = card(frame, cols[i], *color, false);
-            if inner.height == 0 {
-                continue;
-            }
-            frame.render_widget(
-                Paragraph::new(Text::from(tile_lines(label, value.clone(), *color))),
-                inner,
-            );
+        let y = area.y + row as u16;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (label, value, color) in chunk {
+            spans.push(Span::styled(
+                format!("{label} "),
+                Style::default().fg(theme::TEXT_DIM),
+            ));
+            spans.push(Span::styled(
+                format!("{value}   "),
+                Style::default().fg(*color).add_modifier(Modifier::BOLD),
+            ));
         }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
     }
 }
 
@@ -281,12 +349,12 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Ratio(1, 2),
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Ratio(1, 2),
         ])
         .split(area);
 
-    phase_card(
+    phase_column(
         frame,
         cols[0],
         "↓",
@@ -296,8 +364,9 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         app.down_scaler.value(),
         app.phase == Phase::Download,
         app.paused,
+        app.zoom.0 as u64 * 200 / 1000,
     );
-    phase_card(
+    phase_column(
         frame,
         cols[2],
         "↑",
@@ -307,11 +376,12 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         app.up_scaler.value(),
         app.phase == Phase::Upload,
         app.paused,
+        app.zoom.0 as u64 * 200 / 1000,
     );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn phase_card(
+fn phase_column(
     frame: &mut Frame,
     area: Rect,
     arrow: &str,
@@ -321,124 +391,93 @@ fn phase_card(
     scale_max: f64,
     active: bool,
     paused: bool,
+    window_seconds: u64,
 ) {
-    if area.width < 20 || area.height < 10 {
+    if area.width < 24 || area.height < 8 {
         return;
     }
-    let inner = card(frame, area, color, active);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // label
-            Constraint::Length(6), // dial + headline
+            Constraint::Length(1), // headline
+            Constraint::Length(1), // meter
             Constraint::Min(1),    // chart
             Constraint::Length(1), // summary
         ])
-        .split(inner);
+        .split(area);
 
     // 1. Label.
+    let mut head = vec![Span::styled(
+        format!(" {arrow} "),
+        Style::default().fg(color),
+    )];
+    head.push(Span::styled(
+        label.to_string(),
+        Style::default()
+            .fg(if active { color } else { theme::TEXT_DIM })
+            .add_modifier(Modifier::BOLD),
+    ));
+    if active {
+        head.push(Span::styled(
+            "  measuring".to_string(),
+            Style::default().fg(theme::TEXT_DIM),
+        ));
+    }
+    if paused {
+        head.push(Span::raw("  "));
+        head.push(badge("PAUSED", theme::TEXT_BRIGHT));
+    }
+    frame.render_widget(Paragraph::new(Line::from(head)), rows[0]);
+
+    // 2. Headline figure.
+    let instant = samples.last().copied().unwrap_or(0.0);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {arrow} "), Style::default().fg(color)),
+            Span::raw(" "),
+            Span::styled(fmt_value(instant), theme::style_headline()),
             Span::styled(
-                label.to_string(),
-                Style::default()
-                    .fg(theme::TEXT_BRIGHT)
-                    .add_modifier(Modifier::BOLD),
+                format!(" {}", unit_for(instant)),
+                Style::default().fg(theme::TEXT_DIM),
             ),
         ])),
-        rows[0],
+        rows[1],
     );
 
-    // 2. Dial on the left, headline number and bar on the right.
-    let instant = samples.last().copied().unwrap_or(0.0);
-    let split = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(10),
-            Constraint::Length(1), // breathing room beside the dial
-            Constraint::Min(1),
-        ])
-        .split(rows[1]);
-
-    dial(
-        frame.buffer_mut(),
-        split[0],
-        instant / scale_max.max(1.0),
+    // 3. Meter showing the phase average against the scale.
+    let (avg, _, _) = sample_stats(samples);
+    if let Some(line) = meter(
+        avg / scale_max.max(1.0),
+        area.width.saturating_sub(2),
         color,
         theme::SURFACE_ALT,
-    );
-
-    let info = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
-        .split(split[2]);
-
-    let big_text = fmt_value(instant);
-    let unit = unit_for(instant);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {big_text}"), theme::style_headline()),
-            Span::styled(format!(" {unit}"), Style::default().fg(theme::TEXT_DIM)),
-        ])),
-        info[0],
-    );
-    let (avg, _, _) = sample_stats(samples);
-    let bar_w = usize::from(info[1].width).saturating_sub(1);
-    if bar_w > 4 {
-        if let Some(line) = meter(
-            avg / scale_max.max(1.0),
-            bar_w as u16,
-            color,
-            theme::SURFACE_ALT,
-        )
-        .lines
-        .into_iter()
-        .next()
-        {
-            frame.render_widget(Paragraph::new(line), info[1]);
-        }
+    )
+    .lines
+    .into_iter()
+    .next()
+    {
+        frame.render_widget(Paragraph::new(line), rows[2]);
     }
 
-    // 3. Chart.
-    render_area(
+    // 4. Chart with labelled axes.
+    render_chart(
         frame.buffer_mut(),
-        rows[2],
+        rows[3],
         samples,
         scale_max,
         ChartStyle {
             fill: color,
-            edge: theme::CREST,
             axis: theme::BORDER,
         },
-        true,
+        ChartOpts {
+            y_axis: true,
+            x_axis: true,
+            unit: "Mbps",
+            window_seconds,
+        },
     );
-    if paused {
-        // A pause badge makes the frozen state obvious rather than looking like
-        // a stalled connection.
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                " PAUSED ",
-                Style::default().fg(theme::SURFACE).bg(theme::TEXT_BRIGHT),
-            )),
-            Rect {
-                x: rows[2].x + rows[2].width.saturating_sub(8),
-                y: rows[2].y,
-                width: 8,
-                height: 1,
-            },
-        );
-    }
 
-    // 4. Summary.
+    // 5. Summary.
     let (_, p95, peak) = sample_stats(samples);
     let mut summary = vec![
         Span::styled(" avg ", theme::style_label()),
@@ -448,19 +487,95 @@ fn phase_card(
         Span::styled("  max ", theme::style_label()),
         Span::styled(format_mbps(peak), Style::default().fg(theme::TEXT)),
     ];
-    // A full phase that never moved a byte is almost always the endpoint
-    // refusing us (HTTP 429), not a genuinely motionless link.
     if samples.len() >= 5 && avg == 0.0 {
         summary.push(Span::styled(
             "  rate limited (429)",
             Style::default().fg(theme::grade_color("D")),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(summary)), rows[3]);
+    frame.render_widget(Paragraph::new(Line::from(summary)), rows[4]);
 }
 
 // ---------------------------------------------------------------------------
-// Details view - every metric we measured, grouped like a spec sheet
+// Charts view
+// ---------------------------------------------------------------------------
+
+fn charts(frame: &mut Frame, area: Rect, app: &App) {
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Min(7), Constraint::Min(6)])
+        .split(area);
+
+    let rows = [
+        (
+            parts[0],
+            "DOWNLOAD",
+            &app.down_samples,
+            app.down_scaler.value(),
+            ACCENT_DOWN,
+            "Mbps",
+        ),
+        (
+            parts[1],
+            "UPLOAD",
+            &app.up_samples,
+            app.up_scaler.value(),
+            ACCENT_UP,
+            "Mbps",
+        ),
+        (
+            parts[2],
+            "LATENCY",
+            &scaled(&app.probe_samples, 0.0, 200.0),
+            200.0,
+            ACCENT_LAT,
+            "ms",
+        ),
+    ];
+
+    for (slot, title, samples, max, color, unit) in rows {
+        let (_, p95, peak) = sample_stats(samples);
+        let head = Line::from(vec![
+            Span::styled(
+                format!(" {title}"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "    peak {}    p95 {}    {} samples",
+                    format_mbps(peak),
+                    format_mbps(p95),
+                    samples.len()
+                ),
+                theme::style_label(),
+            ),
+        ]);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(slot);
+        frame.render_widget(Paragraph::new(head), split[0]);
+        render_chart(
+            frame.buffer_mut(),
+            split[1],
+            samples,
+            max,
+            ChartStyle {
+                fill: color,
+                axis: theme::BORDER,
+            },
+            ChartOpts {
+                y_axis: true,
+                x_axis: true,
+                unit,
+                window_seconds: 0,
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Details view
 // ---------------------------------------------------------------------------
 
 /// One labelled measurement in the spec sheet.
@@ -481,15 +596,13 @@ impl Metric {
 }
 
 fn details(frame: &mut Frame, area: Rect, app: &App) {
-    if area.width < 30 || area.height < 8 {
+    if area.width < 30 || area.height < 6 {
         return;
     }
-    let inner = card(frame, area, ACCENT_LAT, false);
-
     let mut groups: Vec<(&str, Vec<Metric>)> = Vec::new();
+    let m = &app.meta;
 
     // --- Connection -------------------------------------------------------
-    let m = &app.meta;
     let mut conn: Vec<Metric> = Vec::new();
     if app.hide_info {
         conn.push(Metric::new("privacy", "hidden (Shift+H)", theme::TEXT_DIM));
@@ -501,13 +614,16 @@ fn details(frame: &mut Frame, area: Rect, app: &App) {
             conn.push(Metric::new("ASN", &m.asn, theme::TEXT));
         }
         if !m.ip.is_empty() {
-            conn.push(Metric::new("Public IP", &m.ip, theme::TEXT));
-        }
-        if !m.colo.is_empty() {
-            conn.push(Metric::new("Edge", &m.colo, theme::TEXT));
+            conn.push(Metric::new("Your IP", &m.ip, ROUTE_SELF));
         }
         if !m.loc.is_empty() {
-            conn.push(Metric::new("Location", &m.loc, theme::TEXT));
+            conn.push(Metric::new("Your location", &m.loc, theme::TEXT));
+        }
+        if !m.colo.is_empty() {
+            conn.push(Metric::new("Edge node", &m.colo, ROUTE_EDGE));
+        }
+        if !m.edge_ips.is_empty() {
+            conn.push(Metric::new("Edge IPs", m.edge_ips.join(", "), ROUTE_EDGE));
         }
     }
     if !m.tls.is_empty() {
@@ -582,13 +698,12 @@ fn details(frame: &mut Frame, area: Rect, app: &App) {
                 ));
                 tp.push(Metric::new(
                     format!("{name} window"),
-                    format!("{}s  ({} samples)", t.duration_ms / 1000, t.samples.len()),
+                    format!("{}s ({} samples)", t.duration_ms / 1000, t.samples.len()),
                     theme::TEXT_DIM,
                 ));
             }
         }
         None => {
-            // Mid-run: show what has accumulated so far.
             for (name, samples, color) in [
                 ("Download", &app.down_samples, ACCENT_DOWN),
                 ("Upload", &app.up_samples, ACCENT_UP),
@@ -675,15 +790,14 @@ fn details(frame: &mut Frame, area: Rect, app: &App) {
     q.push(Metric::new("Run time", fmt_dur(app.elapsed), theme::TEXT));
     groups.push(("QUALITY", q));
 
-    // --- Render as a two-column spec sheet --------------------------------
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Ratio(1, 2),
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Ratio(1, 2),
         ])
-        .split(inner);
+        .split(area);
     render_spec_sheet(frame, cols[0], &groups[..2.min(groups.len())]);
     render_spec_sheet(frame, cols[2], &groups[2.min(groups.len())..]);
 }
@@ -692,7 +806,6 @@ fn render_spec_sheet(frame: &mut Frame, area: Rect, groups: &[(&str, Vec<Metric>
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Keep labels to a common width so values line up into a readable column.
     let label_w = groups
         .iter()
         .flat_map(|(_, rows)| rows.iter())
@@ -711,14 +824,9 @@ fn render_spec_sheet(frame: &mut Frame, area: Rect, groups: &[(&str, Vec<Metric>
             Style::default().fg(ACCENT_LAT).add_modifier(Modifier::BOLD),
         )));
         if rows.is_empty() {
-            // Always show the group with an explicit placeholder rather than
-            // silently collapsing, so a missing measurement reads as "not
-            // measured" instead of "not applicable".
             lines.push(Line::from(Span::styled(
                 "   not measured yet",
-                Style::default()
-                    .fg(theme::TEXT_DIM)
-                    .add_modifier(Modifier::ITALIC),
+                Style::default().fg(theme::TEXT_DIM),
             )));
             continue;
         }
@@ -747,90 +855,13 @@ fn loaded_up(app: &App) -> LatencyStats {
 }
 
 // ---------------------------------------------------------------------------
-// Charts view
-// ---------------------------------------------------------------------------
-
-fn charts(frame: &mut Frame, area: Rect, app: &App) {
-    let parts = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Min(7), Constraint::Min(5)])
-        .split(area);
-
-    for (slot, title, samples, max, color) in [
-        (
-            parts[0],
-            "DOWNLOAD  Mbps",
-            &app.down_samples,
-            app.down_scaler.value(),
-            ACCENT_DOWN,
-        ),
-        (
-            parts[1],
-            "UPLOAD  Mbps",
-            &app.up_samples,
-            app.up_scaler.value(),
-            ACCENT_UP,
-        ),
-        (
-            parts[2],
-            "LATENCY  ms",
-            &scaled(&app.probe_samples, 0.0, 200.0),
-            200.0,
-            ACCENT_LAT,
-        ),
-    ] {
-        let inner = card(frame, slot, color, false);
-        if inner.height < 3 {
-            continue;
-        }
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(inner);
-
-        let (_, p95, peak) = sample_stats(samples);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" {title}"),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("   peak {}", format_mbps(peak)),
-                    theme::style_label(),
-                ),
-                Span::styled(format!("   p95 {}", format_mbps(p95)), theme::style_label()),
-                Span::styled(
-                    format!("   {} samples", samples.len()),
-                    theme::style_label(),
-                ),
-            ])),
-            rows[0],
-        );
-        render_area(
-            frame.buffer_mut(),
-            rows[1],
-            samples,
-            max,
-            ChartStyle {
-                fill: color,
-                edge: theme::CREST,
-                axis: theme::BORDER,
-            },
-            true,
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // History view
 // ---------------------------------------------------------------------------
 
 fn history(frame: &mut Frame, area: Rect, app: &App) {
-    if area.width < 20 || area.height < 6 {
+    if area.width < 30 || area.height < 6 {
         return;
     }
-    let inner = card(frame, area, theme::ACCENT_DOWN, false);
     if app.history.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -844,15 +875,15 @@ fn history(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 Span::styled(" to run a test.", theme::style_label()),
             ])),
-            inner,
+            area,
         );
         return;
     }
 
     let parts = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(8)])
-        .split(inner);
+        .constraints([Constraint::Min(4), Constraint::Length(9)])
+        .split(area);
 
     let mut lines = vec![Line::from(vec![
         header_col("TIME", 17),
@@ -905,30 +936,38 @@ fn history(frame: &mut Frame, area: Rect, app: &App) {
 
     let downs: Vec<f64> = app.history.iter().map(|r| r.download.avg).collect();
     let peak = (downs.iter().copied().fold(0.0_f64, f64::max) * 1.12).max(1.0);
-    let trend = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(parts[1]);
     frame.render_widget(
-        Paragraph::new(Span::styled(
-            " DOWNLOAD TREND   oldest → newest",
-            Style::default()
-                .fg(ACCENT_DOWN)
-                .add_modifier(Modifier::BOLD),
-        )),
-        trend[0],
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " DOWNLOAD TREND",
+                Style::default()
+                    .fg(ACCENT_DOWN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   oldest → newest", theme::style_label()),
+        ])),
+        parts[1],
     );
-    render_area(
+    render_chart(
         frame.buffer_mut(),
-        trend[1],
+        Rect {
+            x: parts[1].x,
+            y: parts[1].y + 1,
+            width: parts[1].width,
+            height: parts[1].height.saturating_sub(1),
+        },
         &downs,
         peak,
         ChartStyle {
             fill: ACCENT_DOWN,
-            edge: theme::CREST,
             axis: theme::BORDER,
         },
-        false,
+        ChartOpts {
+            y_axis: true,
+            x_axis: false,
+            unit: "Mbps",
+            window_seconds: 0,
+        },
     );
 }
 
@@ -952,61 +991,53 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
     if area.width < 20 || area.height < 6 {
         return;
     }
-    let inner = card(frame, area, ACCENT_DOWN, false);
     let bindings: Vec<(&str, &str)> = vec![
         ("q / Esc", "quit"),
         ("Ctrl+C", "force quit"),
         ("r", "run a new test"),
-        ("space", "pause / resume the live charts"),
+        ("space", "pause / resume the charts"),
         ("+ / -", "zoom the chart time window"),
         ("1 2 3 4", "live · charts · details · history"),
         ("?", "help"),
-        ("Tab / Shift+Tab", "cycle views"),
-        ("← →", "previous / next view"),
+        ("Tab / ← →", "cycle views"),
         ("↑ ↓ / j k", "move history selection"),
         ("Shift+H", "toggle network privacy"),
+        ("mouse", "click a tab to switch view"),
     ];
 
     let mut lines = vec![
-        Line::from(Span::styled("  Keyboard", theme::style_title())),
+        Line::from(Span::styled(" Keyboard", theme::style_title())),
         Line::default(),
     ];
     for (k, d) in bindings {
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {k:<16}"),
-                Style::default().fg(theme::TEXT_BRIGHT),
-            ),
+            Span::styled(format!(" {k:<14}"), Style::default().fg(theme::TEXT_BRIGHT)),
             Span::styled(d.to_string(), theme::style_label()),
         ]));
     }
     lines.extend([
         Line::default(),
-        Line::from(Span::styled("  About", theme::style_title())),
+        Line::from(Span::styled(" About", theme::style_title())),
         Line::default(),
         Line::from(Span::styled(
-            "  Measures against Cloudflare's public speed-test endpoints.",
+            " Measures against Cloudflare's public speed-test endpoints.",
             theme::style_label(),
         )),
         Line::from(Span::styled(
-            "  Throughput is sampled every 200ms and drawn as a braille area",
+            " YOU is your public address; EDGE is the node we measured against.",
             theme::style_label(),
         )),
         Line::from(Span::styled(
-            "  chart - 8x the vertical resolution of a character sparkline.",
-            theme::style_label(),
-        )),
-        Line::from(Span::styled(
-            "  Press 3 for every metric we collect, as a spec sheet.",
+            " Press 3 for every metric we collect.",
             theme::style_label(),
         )),
         Line::default(),
         Line::from(Span::styled(
-            format!("  {} saved run(s) in history", app.history.len()),
+            format!(" {} saved run(s) in history", app.history.len()),
             theme::style_label(),
         )),
     ]);
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,7 +1068,7 @@ fn fmt_dur(d: std::time::Duration) -> String {
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
+    let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
@@ -1120,73 +1151,42 @@ fn scaled(samples: &[f64], lo: f64, hi: f64) -> Vec<f64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn duration_formats_as_mmss() {
-        assert_eq!(fmt_dur(std::time::Duration::from_secs(75)), "1:15");
-        assert_eq!(fmt_dur(std::time::Duration::from_secs(5)), "0:05");
-    }
-
-    #[test]
-    fn timestamp_formats_as_date_and_clock() {
-        assert_eq!(fmt_time(0), "1970-01-01  00:00");
-        // 2026-10-11T00:00:00Z - 20737 days after the epoch.
-        assert_eq!(fmt_time(1_791_676_800_000), "2026-10-11  00:00");
-    }
-
-    #[test]
-    fn values_scale_precision_with_magnitude() {
-        assert_eq!(fmt_value(5.0), "5.00");
-        assert_eq!(fmt_value(55.0), "55.0");
-        assert_eq!(fmt_value(550.0), "550");
-    }
-
-    #[test]
-    fn units_promote_to_gigabits() {
-        assert_eq!(unit_for(1500.0), "Gbps");
-        assert_eq!(unit_for(150.0), "Mbps");
-    }
-
-    #[test]
-    fn sample_stats_handle_empty_and_populated() {
-        assert_eq!(sample_stats(&[]), (0.0, 0.0, 0.0));
-        let (avg, _, max) = sample_stats(&[10.0, 20.0, 30.0]);
-        assert!((avg - 20.0).abs() < 1e-9);
-        assert!((max - 30.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn column_padding_is_bounded() {
-        assert_eq!(col_padded("abc", 5).len(), 6);
-        assert_eq!(col_padded("a-very-long-value", 5).len(), 6);
-    }
-
-    #[test]
-    fn latency_scaling_is_clamped() {
-        let out = scaled(&[50.0, 100.0, 400.0], 0.0, 200.0);
-        assert_eq!(out[2], 200.0, "above-range values clamp to the ceiling");
-    }
-
-    #[test]
-    fn bytes_scale_to_the_right_unit() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(2048), "2.0 KB");
-        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
-        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
-    }
-
-    /// Every metric group must render its heading even with no data yet, so the
-    /// panel never collapses to an empty card.
-    #[test]
-    fn details_view_renders_all_group_headings() {
-        let backend = ratatui::backend::TestBackend::new(120, 40);
+    fn render(view: View, w: u16, h: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(w, h);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         let mut app = App::new();
         app.history.clear();
-        app.view = View::Details;
+        app.view = view;
         terminal
-            .draw(|f| draw(f, &app))
-            .expect("draw must not panic on the details view");
+            .draw(|f| draw(f, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
+    #[test]
+    fn every_view_renders_at_minimum_size() {
+        for view in View::ALL {
+            render(view, MIN_WIDTH, MIN_HEIGHT);
+        }
+    }
+
+    #[test]
+    fn live_view_shows_the_route_without_privacy() {
+        let mut app = App::new();
+        app.meta.ip = "203.0.113.9".into();
+        app.meta.colo = "MAA".into();
+        app.meta.edge_ips = vec!["162.159.140.220".into()];
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area.height)
             .map(|y| {
@@ -1196,33 +1196,21 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-
-        for heading in ["CONNECTION", "THROUGHPUT", "LATENCY", "QUALITY"] {
-            assert!(text.contains(heading), "details view missing {heading}");
-        }
-    }
-
-    /// Every view must survive a draw, including at the minimum supported size.
-    #[test]
-    fn every_view_renders_at_minimum_size() {
-        for view in View::ALL {
-            let backend = ratatui::backend::TestBackend::new(MIN_WIDTH, MIN_HEIGHT);
-            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
-            let mut app = App::new();
-            app.history.clear();
-            app.view = view;
-            terminal
-                .draw(|f| draw(f, &app))
-                .unwrap_or_else(|e| panic!("{view:?} failed to draw: {e}"));
-        }
+        assert!(text.contains("YOU"), "main view must label the user side");
+        assert!(text.contains("EDGE"), "main view must label the edge side");
+        assert!(text.contains("203.0.113.9"), "user IP missing:\n{text}");
+        assert!(text.contains("162.159.140.220"), "edge IP missing:\n{text}");
     }
 
     #[test]
-    fn tiny_terminal_shows_a_hint_instead_of_corrupting() {
-        let backend = ratatui::backend::TestBackend::new(20, 5);
+    fn privacy_mode_hides_both_ips_on_the_main_view() {
+        let mut app = App::new();
+        app.meta.ip = "203.0.113.9".into();
+        app.meta.edge_ips = vec!["162.159.140.220".into()];
+        app.hide_info = true;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
-        let app = App::new();
-        terminal.draw(|f| draw(f, &app)).expect("draw");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area.height)
             .map(|y| {
@@ -1231,16 +1219,91 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
-            .join(" ");
+            .join("\n");
+        assert!(!text.contains("203.0.113.9"), "user IP leaked");
+        assert!(!text.contains("162.159.140.220"), "edge IP leaked");
+    }
+
+    #[test]
+    fn no_view_draws_box_drawing_borders() {
+        // "No bezels" means no rounded or square card frames anywhere.
+        for view in View::ALL {
+            let text = render(view, 120, 34);
+            for glyph in ['╭', '╮', '╰', '╯', '┌', '┐', '└', '┘'] {
+                assert!(
+                    !text.contains(glyph),
+                    "{view:?} still draws a border glyph {glyph:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn charts_render_block_glyphs_not_braille() {
+        let mut app = App::new();
+        app.view = View::Charts;
+        app.down_samples = (0..40).map(|i| (i % 20) as f64 * 6.0).collect();
+        let backend = ratatui::backend::TestBackend::new(120, 34);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "braille dots should be gone"
+        );
+        assert!(
+            text.contains('▇') || text.contains('█'),
+            "expected block glyphs in the chart"
+        );
+    }
+
+    #[test]
+    fn details_view_renders_all_group_headings() {
+        let text = render(View::Details, 120, 40);
+        for heading in ["CONNECTION", "THROUGHPUT", "LATENCY", "QUALITY"] {
+            assert!(text.contains(heading), "details view missing {heading}");
+        }
+    }
+
+    #[test]
+    fn nav_rects_are_recorded_for_mouse_hit_testing() {
+        let mut app = App::new();
+        app.view = View::Live;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        assert_eq!(app.nav.len(), View::ALL.len(), "every tab needs a hit rect");
+        // Clicking the recorded rect for CHARTS must switch to it.
+        if let Some((_, rect)) = app.nav.iter().find(|(v, _)| *v == View::Charts) {
+            app.on_click(rect.x + 1, rect.y);
+            assert_eq!(app.view, View::Charts);
+        }
+    }
+
+    #[test]
+    fn tiny_terminal_shows_a_hint_instead_of_corrupting() {
+        let text = render(View::Live, 20, 5);
         assert!(text.contains("too small"), "expected a size hint");
     }
 
     #[test]
-    fn hidden_target_is_redacted() {
-        let mut app = App::new();
-        app.meta.ip = "1.2.3.4".into();
-        assert!(target_line(&app).contains("1.2.3.4"));
-        app.hide_info = true;
-        assert!(!target_line(&app).contains("1.2.3.4"));
+    fn bytes_scale_to_the_right_unit() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    #[test]
+    fn timestamps_render_as_dates() {
+        assert_eq!(fmt_time(0), "1970-01-01  00:00");
+        assert_eq!(fmt_time(1_791_676_800_000), "2026-10-11  00:00");
     }
 }

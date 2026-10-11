@@ -139,6 +139,10 @@ pub struct Meta {
     pub tls_ms: f64,
     #[serde(default)]
     pub tls_cipher: String,
+    /// Addresses `speed.cloudflare.com` resolved to - the edge nodes we
+    /// actually connect to, as distinct from the user's own public IP.
+    #[serde(default)]
+    pub edge_ips: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -369,19 +373,26 @@ impl Runner {
     /// the test itself.
     pub async fn fetch_meta(&self) -> Meta {
         let started = Instant::now();
-        let dns_ms = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::net::lookup_host("speed.cloudflare.com:443")
-                .await
-                .ok()
-        })
+        // Resolve once and keep the addresses: this gives both the DNS timing
+        // and the edge IPs we are about to connect to.
+        let resolved: Vec<String> = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::lookup_host("speed.cloudflare.com:443"),
+        )
         .await
         .ok()
-        .flatten()
-        .map(|_| started.elapsed().as_secs_f64() * 1000.0)
-        .unwrap_or(0.0);
+        .and_then(|r| r.ok())
+        .map(|addrs| addrs.map(|a| a.to_string()).collect())
+        .unwrap_or_default();
+        let dns_ms = if resolved.is_empty() {
+            0.0
+        } else {
+            started.elapsed().as_secs_f64() * 1000.0
+        };
 
         let mut meta = Meta {
             dns_ms,
+            edge_ips: resolved,
             ..Default::default()
         };
 

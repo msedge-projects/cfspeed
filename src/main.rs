@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CEvent, EventStream, KeyEventKind,
+    MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -74,7 +75,7 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        terminal.draw(|frame| ui::views::draw(frame, &app))?;
+        terminal.draw(|frame| ui::views::draw(frame, &mut app))?;
 
         tokio::select! {
             // Measurement events take priority so charts stay smooth.
@@ -85,6 +86,12 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
                 match maybe {
                     Some(Ok(CEvent::Key(key))) if key.kind == KeyEventKind::Press => {
                         app.on_key(key);
+                    }
+                    Some(Ok(CEvent::Mouse(mouse))) => {
+                        // Only a left-button press counts as a navigation click.
+                        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                            app.on_click(mouse.column, mouse.row);
+                        }
                     }
                     Some(Ok(CEvent::Resize(_, _))) => {
                         // Ratatui redraws at full size on the next frame.

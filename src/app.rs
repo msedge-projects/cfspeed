@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 
 use crate::history;
 use crate::speed::{
@@ -102,6 +103,11 @@ pub struct App {
     pub elapsed: Duration,
     pub hide_info: bool,
 
+    /// Clickable nav tabs, recorded during draw so a mouse press can be
+    /// resolved to a view. Rendering and hit-testing must agree, so the
+    /// geometry is computed once per frame in `views::draw`.
+    pub nav: Vec<(View, Rect)>,
+
     /// Freezes chart updates without stopping the measurement, so a number can
     /// be read off the screen without it racing away.
     pub paused: bool,
@@ -135,6 +141,7 @@ impl App {
             hide_info: false,
             paused: false,
             zoom: Zoom::default(),
+            nav: Vec::new(),
             status: String::new(),
             error: None,
             restart: false,
@@ -281,6 +288,24 @@ impl App {
     pub fn window<'a>(&self, samples: &'a [f64]) -> &'a [f64] {
         let n = self.zoom.0.min(samples.len());
         &samples[samples.len() - n..]
+    }
+
+    /// Resolve a mouse click to a nav tab.
+    ///
+    /// Mouse capture is enabled, so presses arrive here rather than being
+    /// swallowed by the terminal. A click outside every recorded tab is
+    /// ignored, which keeps stray clicks from changing view.
+    pub fn on_click(&mut self, x: u16, y: u16) {
+        for (view, rect) in &self.nav {
+            if x >= rect.x
+                && x < rect.x.saturating_add(rect.width)
+                && y >= rect.y
+                && y < rect.y.saturating_add(rect.height)
+            {
+                self.view = *view;
+                return;
+            }
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -467,6 +492,33 @@ mod tests {
     }
 
     /// Build a Press key event; Windows emits Release too, which must be ignored.
+    /// A click inside the given rect activates the tab.
+    #[test]
+    fn clicking_a_nav_tab_switches_view() {
+        let mut a = app();
+        // Simulate what `views::draw` records for the first tab.
+        a.nav = vec![
+            (View::Live, Rect::new(2, 30, 6, 1)),
+            (View::Charts, Rect::new(10, 30, 8, 1)),
+        ];
+        a.on_click(11, 30);
+        assert_eq!(a.view, View::Charts);
+        a.on_click(3, 30);
+        assert_eq!(a.view, View::Live);
+    }
+
+    #[test]
+    fn clicking_dead_space_changes_nothing() {
+        let mut a = app();
+        a.nav = vec![(View::Live, Rect::new(2, 30, 6, 1))];
+        a.view = View::History;
+        a.on_click(40, 5);
+        assert_eq!(a.view, View::History, "a stray click must be ignored");
+        // Edge case: the row just past the last column of a tab.
+        a.on_click(8, 30);
+        assert_eq!(a.view, View::History);
+    }
+
     fn press(c: char) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(c),

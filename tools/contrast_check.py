@@ -20,20 +20,21 @@ def contrast(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 
-SURFACE = "#17181C"
-SURFACE_ALT = "#1F2126"
+# Tokyo Night, as shipped in btop's themes/tokyo-night.theme
+SURFACE = "#1a1b26"
+SURFACE_ALT = "#292e42"
 
 PALETTE = {
-    "TEXT": "#C4C7CE",
-    "TEXT_BRIGHT": "#EDEFF2",
-    "TEXT_DIM": "#8E939C",
-    "BORDER": "#343842",
-    "ACCENT_DOWN": "#5CC0A8",
-    "ACCENT_UP": "#E0A458",
-    "ACCENT_LAT": "#9B8FD4",
-    "GRADE_A": "#6FBF73",
-    "GRADE_C": "#E0C060",
-    "GRADE_F": "#DC6B62",
+    "TEXT": "#a9b1d6",
+    "TEXT_BRIGHT": "#c0caf5",
+    "TEXT_DIM": "#9399b5",
+    "BORDER": "#3b4261",
+    "ACCENT_DOWN": "#9ece6a",
+    "ACCENT_UP": "#e0af68",
+    "ACCENT_LAT": "#7dcfff",
+    "GRADE_A": "#9ece6a",
+    "GRADE_C": "#e0af68",
+    "GRADE_F": "#f7768e",
 }
 
 print(f"surface {SURFACE} / alt {SURFACE_ALT}\n")
