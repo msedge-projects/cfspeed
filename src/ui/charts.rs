@@ -19,6 +19,37 @@ use ratatui::text::{Line, Span, Text};
 
 use crate::ui::theme;
 
+/// Bit for the braille dot at sub-column `sx` (0=left, 1=right) and sub-row
+/// `sy` (0=top .. 3=bottom).
+///
+/// Dots are numbered down each column first:
+/// ```text
+/// dot1 dot4
+/// dot2 dot5
+/// dot3 dot6
+/// dot7 dot8
+/// ```
+#[must_use]
+pub fn dot_bit(sx: usize, sy: usize) -> u8 {
+    let dot = match sy {
+        0..=2 => {
+            if sx == 0 {
+                sy + 1
+            } else {
+                sy + 4
+            }
+        }
+        _ => 7 + sx,
+    };
+    1u8 << (dot - 1)
+}
+
+/// Glyph for a raw dot bitmask.
+#[must_use]
+pub fn braille_from_bits(bits: u8) -> char {
+    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+}
+
 #[derive(Clone, Copy)]
 pub struct ChartStyle {
     /// Colour of the curve itself.
@@ -79,6 +110,13 @@ pub struct ChartOpts {
     pub unit: &'static str,
     /// Seconds shown on the time axis (0 omits it).
     pub window_seconds: u64,
+    /// Draw the wave with braille sub-pixels instead of half blocks.
+    ///
+    /// Half blocks give the edge two steps per cell; braille gives four
+    /// vertically and two horizontally, so the wave is noticeably finer. The
+    /// body stays solid either way - only the top band that the curve passes
+    /// through is drawn with dots.
+    pub smooth: bool,
 }
 
 impl Default for ChartOpts {
@@ -88,6 +126,7 @@ impl Default for ChartOpts {
             x_axis: true,
             unit: "Mbps",
             window_seconds: 0,
+            smooth: false,
         }
     }
 }
@@ -146,9 +185,11 @@ pub fn render_chart(
     let max = if max > 0.0 { max } else { 1.0 };
     let w = usize::from(plot.width);
     let h = usize::from(plot.height);
-    // A half block splits a cell horizontally, so the plot gets two sub-rows
-    // per cell row and the edge can land between them.
-    let sub_h = h * 2;
+    // Half blocks split a cell horizontally, giving the edge two steps per
+    // cell row. Braille splits it 2x4, so `smooth` takes the finer grid: four
+    // vertical steps and two horizontal ones per cell.
+    let sub_rows = if opts.smooth { 4 } else { 2 };
+    let sub_h = h * sub_rows;
     let sub_w = w * 2;
 
     // Curve height per sub-column, in sub-rows from the top. `None` marks a
@@ -172,17 +213,44 @@ pub fn render_chart(
         })
         .collect();
 
-    // Sample at the centre of each cell, interpolating between the two
-    // sub-columns. Taking the higher of them instead would turn a single sharp
-    // sample into a full-height one-cell spike.
+    // Smooth mode takes the higher of the two sub-columns, so the solid body
+    // still reaches the drawn wave. Solid mode samples the cell centre instead,
+    // which stops one sharp sample becoming a full-height spike.
     let y_cell: Vec<Option<usize>> = (0..w)
         .map(|cx| match (y_sub[cx * 2], y_sub[cx * 2 + 1]) {
-            (Some(a), Some(b)) => Some((a + b) / 2.0),
+            (Some(a), Some(b)) => Some(if opts.smooth { a.min(b) } else { (a + b) / 2.0 }),
             (Some(a), None) | (None, Some(a)) => Some(a),
             (None, None) => None,
         })
         .map(|o| o.map(|v| (v.round().max(0.0) as usize).min(sub_h - 1)))
         .collect();
+
+    // Smooth mode draws the wave itself as a braille stroke, giving the edge
+    // four steps per cell vertically and two horizontally. Only the stroke is
+    // dots - the body underneath is still painted solid.
+    let mut line_bits = vec![0u8; w * h];
+    if opts.smooth {
+        let mut prev: Option<usize> = None;
+        for (c, slot) in y_sub.iter().enumerate() {
+            let Some(v) = *slot else { continue };
+            let y = (v.round().max(0.0) as usize).min(sub_h - 1);
+            // Bridge the vertical gap so a steep step is one stroke rather than
+            // two detached dots.
+            let (lo, hi) = match prev {
+                Some(p) if p < y => (p, y),
+                Some(p) if p > y => (y, p),
+                _ => (y, y),
+            };
+            for yy in lo..=hi {
+                let ccx = c / 2;
+                let ccy = yy / sub_rows;
+                if ccx < w && ccy < h {
+                    line_bits[ccy * w + ccx] |= dot_bit(c % 2, yy % sub_rows);
+                }
+            }
+            prev = Some(y);
+        }
+    }
 
     let grid_style = Style::default().fg(style.axis);
     let grid_row = plot.height / 2;
@@ -198,13 +266,18 @@ pub fn render_chart(
 
     for (cx, slot) in y_cell.iter().enumerate() {
         let Some(y) = *slot else { continue };
+        let cell_x = plot.x + cx as u16;
         for cy in 0..h {
-            let cell_top = cy * 2;
-            if y > cell_top + 1 {
+            let cell_top = cy * sub_rows;
+            if opts.smooth {
+                if cy * sub_rows < y {
+                    continue;
+                }
+            } else if y > cell_top + sub_rows - 1 {
                 // Wholly above the curve: leave the grid and background alone.
                 continue;
             }
-            let pos = Position::new(plot.x + cx as u16, plot.y + cy as u16);
+            let pos = Position::new(cell_x, plot.y + cy as u16);
             let Some(cell) = buf.cell_mut(pos) else {
                 continue;
             };
@@ -213,14 +286,27 @@ pub fn render_chart(
             let t = cy as f64 / h.max(1) as f64;
             let body = theme::blend(theme::SURFACE, style.fill, 0.40 + (1.0 - t) * 0.30);
 
-            if y == cell_top + 1 {
+            if opts.smooth {
+                // The body is solid background either way. In the cell the wave
+                // passes through, the stroke is drawn on top of it, so the edge
+                // can land anywhere within the cell instead of on its boundary.
+                let bits = line_bits[cy * w + cx];
+                if bits == 0 {
+                    // Plain body: a blank glyph keeps the cell free of any
+                    // braille code point at all.
+                    cell.set_symbol(" ");
+                    cell.set_style(Style::default().bg(body));
+                } else {
+                    cell.set_symbol(braille_from_bits(bits).encode_utf8(&mut [0u8; 4]));
+                    cell.set_style(Style::default().fg(style.line).bg(body));
+                }
+            } else if y == cell_top + 1 {
                 // The curve sits in this cell's lower half, so the crest fills
                 // it and the upper half keeps the background.
                 cell.set_symbol("▄");
                 cell.set_style(Style::default().fg(style.line));
             } else if y == cell_top {
                 // The curve crosses the upper half: crest on top, body beneath.
-                // Both halves are painted, so there is no gap along the edge.
                 cell.set_symbol("▀");
                 cell.set_style(Style::default().fg(style.line).bg(body));
             } else {
@@ -550,6 +636,7 @@ mod tests {
                 x_axis: true,
                 unit: "Mbps",
                 window_seconds: 30,
+                ..Default::default()
             },
         );
         let text: String = (0..8)

@@ -19,6 +19,7 @@ pub enum Action {
     ExportJson,
     ExportCsv,
     ClearHistory,
+    ToggleChartEdge,
 }
 
 impl Action {
@@ -31,6 +32,7 @@ impl Action {
             Action::ExportJson => "Export history as JSON",
             Action::ExportCsv => "Export history as CSV",
             Action::ClearHistory => "Clear history",
+            Action::ToggleChartEdge => "Chart edge: smooth",
         }
     }
 
@@ -40,6 +42,17 @@ impl Action {
             Action::ExportJson => "writes cfspeed-history.json",
             Action::ExportCsv => "writes cfspeed-history.csv",
             Action::ClearHistory => "removes every saved run",
+            Action::ToggleChartEdge => "4 steps per cell, dotted edge",
+        }
+    }
+
+    /// Label for the edge that is currently *not* in use, so the menu always
+    /// offers the switch to the other style.
+    pub fn edge_label(smooth: bool) -> &'static str {
+        if smooth {
+            "Chart edge: solid"
+        } else {
+            "Chart edge: smooth"
         }
     }
 }
@@ -122,7 +135,7 @@ impl Default for Zoom {
 }
 
 /// Static list of palette entries, so the menu never has to be rebuilt.
-pub const MENU: [Action; 7] = [
+pub const MENU: [Action; 8] = [
     Action::Run(TestMode::Full),
     Action::Run(TestMode::Latency),
     Action::Run(TestMode::Download),
@@ -130,6 +143,7 @@ pub const MENU: [Action; 7] = [
     Action::ExportJson,
     Action::ExportCsv,
     Action::ClearHistory,
+    Action::ToggleChartEdge,
 ];
 
 pub struct App {
@@ -176,6 +190,8 @@ pub struct App {
     pub error: Option<String>,
     pub restart: bool,
     pub quit: bool,
+    /// Draw chart edges with braille sub-pixels for a finer wave.
+    pub smooth_charts: bool,
 
     /// Identifies the current run. Events tagged with an older generation are
     /// discarded, so a superseded runner can never mix samples into a new test.
@@ -212,6 +228,7 @@ impl App {
             error: None,
             restart: false,
             quit: false,
+            smooth_charts: true,
             generation: 0,
         }
     }
@@ -440,6 +457,17 @@ impl App {
                 }
                 Err(e) => self.status = format!("export failed: {e}"),
             },
+            Action::ToggleChartEdge => {
+                self.smooth_charts = !self.smooth_charts;
+                self.status = format!(
+                    "chart edge: {}",
+                    if self.smooth_charts {
+                        "smooth"
+                    } else {
+                        "solid"
+                    }
+                );
+            }
             Action::ClearHistory => match history::clear() {
                 Ok(_) => {
                     self.history.clear();
@@ -845,5 +873,33 @@ mod tests {
         release.kind = crossterm::event::KeyEventKind::Release;
         a.on_key(release);
         assert_eq!(a.view, View::Charts, "a Release must not switch views");
+    }
+
+    /// The edge style has to be switchable at runtime: smooth gives four steps
+    /// per cell but a dotted stroke, solid is fully dotless but coarser.
+    #[test]
+    fn the_edge_style_toggles_and_the_menu_offers_the_other_one() {
+        let mut a = app();
+        assert!(a.smooth_charts, "smooth is the default");
+        assert_eq!(
+            Action::edge_label(a.smooth_charts),
+            "Chart edge: solid",
+            "the menu should offer the switch to solid"
+        );
+
+        a.run_action(Action::ToggleChartEdge);
+        assert!(!a.smooth_charts);
+        assert_eq!(
+            Action::edge_label(a.smooth_charts),
+            "Chart edge: smooth",
+            "the menu should offer the switch back to smooth"
+        );
+
+        a.run_action(Action::ToggleChartEdge);
+        assert!(a.smooth_charts);
+        assert!(
+            MENU.contains(&Action::ToggleChartEdge),
+            "the toggle must be reachable from the palette"
+        );
     }
 }
