@@ -1,14 +1,16 @@
 //! Chart primitives rendered directly into a ratatui `Buffer`.
 //!
-//! The curve is drawn with braille sub-pixels (2x4 dots per cell) so it has 8x
-//! the vertical resolution of a character grid, which is what removes the
-//! staircase. The body below the curve is filled on the same sub-pixel grid,
-//! graded from the surface colour up to the accent, so the chart reads as a
-//! solid shape with a smooth edge rather than a row of bars.
+//! The body under the curve is painted with *background colour* rather than
+//! glyphs. A cell carrying a background fills its whole area with no gaps, so
+//! the area reads as one solid shape. The crest is a half-block glyph, the only
+//! way to split a cell horizontally while staying solid, which places the edge
+//! between the two sub-rows of a cell rather than on a cell boundary.
 //!
-//! Earlier revisions used the `▁▂▃▄▅▆▇█` block ramp, which is readable but steps
-//! a whole character per column; and used braille to *fill*, which is
-//! unreadable texture. This is braille used as an outline, which is neither.
+//! Two earlier revisions failed this. The `▁▂▃▄▅▆▇█` block ramp is readable but steps
+//! a whole character per column. Filling with braille has finer resolution but
+//! can only ever cover a cell in dots, so a filled body drawn as `⠹` reads
+//! as a dot screen rather than a graph. Half blocks plus a background fill give
+//! up two of braille's eight sub-rows and buy an area with no texture at all.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -16,37 +18,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
 use crate::ui::theme;
-
-/// Bit for the braille dot at sub-column `sx` (0=left, 1=right) and sub-row
-/// `sy` (0=top .. 3=bottom).
-///
-/// Braille dots are numbered down each column first:
-/// ```text
-/// dot1 dot4
-/// dot2 dot5
-/// dot3 dot6
-/// dot7 dot8
-/// ```
-#[must_use]
-pub fn dot_bit(sx: usize, sy: usize) -> u8 {
-    let dot = match sy {
-        0..=2 => {
-            if sx == 0 {
-                sy + 1
-            } else {
-                sy + 4
-            }
-        }
-        _ => 7 + sx,
-    };
-    1u8 << (dot - 1)
-}
-
-/// Glyph for a raw dot bitmask.
-#[must_use]
-pub fn braille_from_bits(bits: u8) -> char {
-    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
-}
 
 #[derive(Clone, Copy)]
 pub struct ChartStyle {
@@ -175,96 +146,89 @@ pub fn render_chart(
     let max = if max > 0.0 { max } else { 1.0 };
     let w = usize::from(plot.width);
     let h = usize::from(plot.height);
+    // A half block splits a cell horizontally, so the plot gets two sub-rows
+    // per cell row and the edge can land between them.
+    let sub_h = h * 2;
     let sub_w = w * 2;
-    let sub_h = h * 4;
 
-    // Curve position per sub-column, in sub-rows from the top. `None` marks a
+    // Curve height per sub-column, in sub-rows from the top. `None` marks a
     // column before the first sample arrived.
+    //
+    // Values are interpolated between neighbouring samples so the edge glides
+    // across a cell instead of stepping once per column.
     let first = data.len().saturating_sub(w);
-    let ys: Vec<Option<usize>> = (0..sub_w)
+    let y_sub: Vec<Option<f64>> = (0..sub_w)
         .map(|c| {
-            // Sub-columns 0..first carry the gap between samples when data is
-            // denser than the plot; otherwise the sample maps straight across.
-            let i = first + c / 2;
-            if i >= data.len() {
+            let pos = first as f64 + c as f64 / 2.0;
+            let i0 = pos.floor() as usize;
+            if i0 >= data.len() {
                 return None;
             }
-            let norm = (data[i] / max).clamp(0.0, 1.0);
-            let y = ((1.0 - norm) * (sub_h - 1) as f64).round() as usize;
-            Some(y.min(sub_h - 1))
+            let frac = pos - i0 as f64;
+            let a = data[i0];
+            let b = data.get(i0 + 1).copied().unwrap_or(a);
+            let norm = ((a + (b - a) * frac) / max).clamp(0.0, 1.0);
+            Some((1.0 - norm) * (sub_h - 1) as f64)
         })
         .collect();
 
-    // Two bitmasks per cell: the curve stroke, and the filled body beneath it.
-    let mut line_bits = vec![0u8; w * h];
-    let mut fill_bits = vec![0u8; w * h];
-
-    let set = |bits: &mut Vec<u8>, col: usize, row: usize| {
-        let (cx, sx) = (col / 2, col % 2);
-        let (cy, sy) = (row / 4, row % 4);
-        if cx < w && cy < h {
-            bits[cy * w + cx] |= dot_bit(sx, sy);
-        }
-    };
-
-    let mut prev: Option<usize> = None;
-    for (c, slot) in ys.iter().enumerate().take(sub_w) {
-        let Some(y) = *slot else { continue };
-        match prev {
-            // Bridge the vertical gap so a steep step is a continuous stroke
-            // rather than two disconnected dots.
-            Some(p) => {
-                let (lo, hi) = if p < y { (p, y) } else { (y, p) };
-                for yy in lo..=hi {
-                    set(&mut line_bits, c, yy);
-                }
-                for yy in (hi + 1)..sub_h {
-                    set(&mut fill_bits, c, yy);
-                }
-            }
-            None => {
-                set(&mut line_bits, c, y);
-                for yy in (y + 1)..sub_h {
-                    set(&mut fill_bits, c, yy);
-                }
-            }
-        }
-        prev = Some(y);
-    }
+    // Sample at the centre of each cell, interpolating between the two
+    // sub-columns. Taking the higher of them instead would turn a single sharp
+    // sample into a full-height one-cell spike.
+    let y_cell: Vec<Option<usize>> = (0..w)
+        .map(|cx| match (y_sub[cx * 2], y_sub[cx * 2 + 1]) {
+            (Some(a), Some(b)) => Some((a + b) / 2.0),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        })
+        .map(|o| o.map(|v| (v.round().max(0.0) as usize).min(sub_h - 1)))
+        .collect();
 
     let grid_style = Style::default().fg(style.axis);
     let grid_row = plot.height / 2;
 
-    for cy in 0..h {
-        for cx in 0..w {
-            let idx = cy * w + cx;
-            let line = line_bits[idx];
-            let fill = fill_bits[idx];
+    // Grid first; the solid body paints over it wherever the chart reaches.
+    for cx in 0..w {
+        let pos = Position::new(plot.x + cx as u16, plot.y + grid_row);
+        if let Some(cell) = buf.cell_mut(pos) {
+            cell.set_symbol("·");
+            cell.set_style(grid_style);
+        }
+    }
+
+    for (cx, slot) in y_cell.iter().enumerate() {
+        let Some(y) = *slot else { continue };
+        for cy in 0..h {
+            let cell_top = cy * 2;
+            if y > cell_top + 1 {
+                // Wholly above the curve: leave the grid and background alone.
+                continue;
+            }
             let pos = Position::new(plot.x + cx as u16, plot.y + cy as u16);
             let Some(cell) = buf.cell_mut(pos) else {
                 continue;
             };
-            let bits = line | fill;
-            if bits != 0 {
-                cell.set_symbol(braille_from_bits(bits).encode_utf8(&mut [0u8; 4]));
-                let st = if line != 0 {
-                    // The stroke stays bright so the edge reads as a curve.
-                    Style::default().fg(style.line).add_modifier(Modifier::BOLD)
-                } else {
-                    // The body carries most of the colour so the chart reads as
-                    // a filled shape rather than an outline. It deepens toward
-                    // the crest and fades slightly into the baseline, which
-                    // anchors the curve and keeps the stroke legible on top.
-                    let t = cy as f64 / h.max(1) as f64;
-                    let ramp = 0.42 + (1.0 - t) * 0.38;
-                    Style::default().fg(theme::blend(theme::SURFACE, style.fill, ramp))
-                };
-                cell.set_style(st);
-            } else if cy == usize::from(grid_row) && opts.y_axis {
-                cell.set_symbol("·");
-                cell.set_style(grid_style);
+            // The body settles toward the baseline, which anchors the shape
+            // instead of leaving a flat slab of one colour.
+            let t = cy as f64 / h.max(1) as f64;
+            let body = theme::blend(theme::SURFACE, style.fill, 0.40 + (1.0 - t) * 0.30);
+
+            if y == cell_top + 1 {
+                // The curve sits in this cell's lower half, so the crest fills
+                // it and the upper half keeps the background.
+                cell.set_symbol("▄");
+                cell.set_style(Style::default().fg(style.line));
+            } else if y == cell_top {
+                // The curve crosses the upper half: crest on top, body beneath.
+                // Both halves are painted, so there is no gap along the edge.
+                cell.set_symbol("▀");
+                cell.set_style(Style::default().fg(style.line).bg(body));
             } else {
+                // Wholly below the curve. A bare background paints the cell
+                // solid with no glyph at all - giving it a half-block here
+                // would stripe the body with a bright line on every row.
                 cell.set_symbol(" ");
+                cell.set_style(Style::default().bg(body));
             }
         }
     }
@@ -425,10 +389,14 @@ mod tests {
             .unwrap_or_else(|| "<oob>".to_string())
     }
 
-    fn is_dot(s: &str) -> bool {
-        s.chars()
-            .next()
-            .is_some_and(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
+    /// True when the cell carries part of the chart: a painted background
+    /// (the solid body) or a half-block crest glyph.
+    fn is_solid(b: &Buffer, x: u16, y: u16) -> bool {
+        let Some(c) = b.cell(Position::new(x, y)) else {
+            return false;
+        };
+        let crest = matches!(c.symbol().chars().next(), Some('▀' | '▄'));
+        crest || !matches!(c.bg, Color::Reset)
     }
 
     fn plot(w: u16, h: u16, data: &[f64], max: f64) -> Buffer {
@@ -449,23 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn dot_bits_match_unicode_numbering() {
-        assert_eq!(dot_bit(0, 0), 0b0000_0001, "top-left is dot1");
-        assert_eq!(dot_bit(1, 0), 0b0000_1000, "top-right is dot4");
-        assert_eq!(dot_bit(0, 3), 0b0100_0000, "bottom-left is dot7");
-        assert_eq!(dot_bit(1, 3), 0b1000_0000, "bottom-right is dot8");
-    }
-
-    #[test]
-    fn empty_cell_is_blank_braille() {
-        assert_eq!(braille_from_bits(0), '\u{2800}');
-    }
-
-    #[test]
     fn full_scale_value_fills_every_row() {
         let b = plot(12, 6, &[100.0], 100.0);
         for y in 0..6 {
-            assert!(is_dot(&sym(&b, 0, y)), "row {y} should carry a dot");
+            assert!(is_solid(&b, 0, y), "row {y} should carry a dot");
         }
     }
 
@@ -474,7 +429,7 @@ mod tests {
         let b = plot(10, 4, &[], 100.0);
         for y in 0..4 {
             for x in 0..10 {
-                assert!(!is_dot(&sym(&b, x, y)), "expected blank at {x},{y}");
+                assert!(!is_solid(&b, x, y), "expected blank at {x},{y}");
             }
         }
     }
@@ -488,7 +443,7 @@ mod tests {
         for x in 0..20 {
             let mut ink = false;
             for y in 0..10 {
-                if is_dot(&sym(&b, x, y)) {
+                if is_solid(&b, x, y) {
                     ink = true;
                 }
             }
@@ -506,7 +461,7 @@ mod tests {
         let top: Vec<i32> = (0..40u16)
             .map(|x| {
                 (0..8u16)
-                    .find(|y| is_dot(&sym(&b, x, *y)))
+                    .find(|y| is_solid(&b, x, *y))
                     .map(i32::from)
                     .unwrap_or(-1)
             })
@@ -528,10 +483,10 @@ mod tests {
         let mut right_ink = 0;
         let mut left_ink = 0;
         for y in 0..4 {
-            if is_dot(&sym(&b, 9, y)) {
+            if is_solid(&b, 9, y) {
                 right_ink += 1;
             }
-            if is_dot(&sym(&b, 0, y)) {
+            if is_solid(&b, 0, y) {
                 left_ink += 1;
             }
         }

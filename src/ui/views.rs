@@ -459,17 +459,25 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
+    // The samples actually drawn, and the span they really cover. The zoom
+    // setting is a maximum, not the truth: a 10s phase inside a 240s window
+    // still only holds 10s of data, and labelling that "240s" makes the time
+    // axis lie about how long the curve is.
+    let down = app.window(&app.down_samples);
+    let up = app.window(&app.up_samples);
+    let span = |n: usize| (n as u64 * 200) / 1000;
+
     phase_column(
         frame,
         cols[0],
         "↓",
         "DOWNLOAD",
         ACCENT_DOWN,
-        app.window(&app.down_samples),
+        down,
         app.down_scaler.value(),
         app.phase == Phase::Download,
         app.paused,
-        app.zoom.0 as u64 * 200 / 1000,
+        span(down.len()),
     );
     phase_column(
         frame,
@@ -477,11 +485,11 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         "↑",
         "UPLOAD",
         ACCENT_UP,
-        app.window(&app.up_samples),
+        up,
         app.up_scaler.value(),
         app.phase == Phase::Upload,
         app.paused,
-        app.zoom.0 as u64 * 200 / 1000,
+        span(up.len()),
     );
 }
 
@@ -1353,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn charts_draw_a_smooth_braille_curve_not_block_bars() {
+    fn charts_paint_a_solid_body_instead_of_braille_dots() {
         let mut app = App::new();
         app.view = View::Charts;
         app.down_samples = (0..40).map(|i| (i % 20) as f64 * 6.0).collect();
@@ -1361,30 +1369,27 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         terminal.draw(|f| draw(f, &mut app)).expect("draw");
         let buf = terminal.backend().buffer().clone();
-        let text: String = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
 
-        // Braille sub-pixels give the curve 8x the vertical resolution of a
-        // character cell, which is what removes the staircase.
-        assert!(
-            text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
-            "expected a braille curve"
-        );
-        // The block ramp is what produced the boxy look; it must not come back.
-        for glyph in ['▁', '▂', '▃', '▄', '▅', '▆', '▇'] {
-            assert!(
-                !text.contains(glyph),
-                "block-ramp glyph {glyph:?} makes the chart look boxy"
-            );
+        let reset = ratatui::style::Color::Reset;
+        let mut painted = 0usize;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if cell.bg != reset {
+                    painted += 1;
+                }
+                let ch = cell.symbol().chars().next().unwrap_or(' ');
+                assert!(
+                    !('⠀'..='⣿').contains(&ch),
+                    "braille dot at {x},{y}: a dotted body reads as dots, not a graph"
+                );
+            }
         }
+        assert!(
+            painted > 100,
+            "the chart body should be painted with background colour, got {painted} cells"
+        );
     }
-
     #[test]
     fn details_view_renders_all_group_headings() {
         let text = render(View::Details, 120, 40);
@@ -1425,5 +1430,39 @@ mod tests {
     fn timestamps_render_as_dates() {
         assert_eq!(fmt_time(0), "1970-01-01  00:00");
         assert_eq!(fmt_time(1_791_676_800_000), "2026-10-11  00:00");
+    }
+
+    /// The time axis has to describe the data actually drawn. A 10s phase inside
+    /// the default 240s window still only holds 10s of samples, so the axis must
+    /// read -10s; labelling it -240s claims four minutes of history that were
+    /// never measured.
+    #[test]
+    fn the_time_axis_reports_the_span_actually_measured() {
+        let mut app = App::new();
+        app.view = View::Live;
+        app.zoom = crate::app::Zoom(1200);
+        // 50 samples at 200ms each is a 10s phase.
+        app.down_samples = vec![100.0; 50];
+        app.up_samples = vec![80.0; 50];
+        let backend = ratatui::backend::TestBackend::new(120, 34);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("-10s"),
+            "axis should read -10s for a 10s phase"
+        );
+        assert!(
+            !text.contains("-240s"),
+            "axis must not claim 240s of history that was never measured"
+        );
     }
 }
