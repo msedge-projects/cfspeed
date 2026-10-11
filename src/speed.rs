@@ -505,10 +505,8 @@ async fn download_worker(
         let n = chunk.load(Ordering::Relaxed);
         let url = format!("{base_url}/__down?bytes={n}");
 
-        let mut ok = false;
-        match client.get(&url).send().await {
+        let ok = match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                ok = true;
                 let mut stream = resp.bytes_stream();
                 while let Some(part) = stream.next().await {
                     match part {
@@ -521,9 +519,10 @@ async fn download_worker(
                         break;
                     }
                 }
+                true
             }
-            _ => ok = false,
-        }
+            _ => false,
+        };
 
         // Adapt the request size: shrink fast when refused, grow back slowly
         // once the endpoint is willing again.
