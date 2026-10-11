@@ -50,8 +50,8 @@ pub fn braille_from_bits(bits: u8) -> char {
 #[must_use]
 pub fn cell_bits(levels: &[u8; 2]) -> u8 {
     let mut bits: u8 = 0;
-    for sx in 0..2usize {
-        let level = usize::from(levels[sx].min(4));
+    for (sx, &lvl) in levels.iter().enumerate() {
+        let level = usize::from(lvl.min(4));
         for sy in 0..4usize {
             if sy >= 4 - level {
                 bits |= dot_bit(sx, sy);
