@@ -50,28 +50,31 @@ jobs:
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/cfspeed dist/
-          cp README.md LICENSE dist/
-          tar -czvf dist/cfspeed-${{ matrix.target }}.tar.gz -C dist .
+          set -euo pipefail
+          # Stage first, then archive - writing the tarball into the directory
+          # being tarred makes tar include and mutate its own output.
+          rm -rf staging dist
+          mkdir -p staging dist
+          cp "target/${{ matrix.target }}/release/cfspeed" staging/
+          cp README.md LICENSE staging/
+          tar -czf "dist/cfspeed-${{ matrix.target }}.tar.gz" -C staging .
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/cfspeed.exe dist/
-          Copy-Item README.md, LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath dist/cfspeed-${{ matrix.target }}.zip
+          Remove-Item -Recurse -Force staging, dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path staging, dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cfspeed.exe" staging/
+          Copy-Item README.md, LICENSE staging/
+          Compress-Archive -Path staging/* -DestinationPath "dist/cfspeed-${{ matrix.target }}.zip"
 
       - name: Checksum
         shell: bash
         working-directory: dist
         run: |
-          for f in *.tar.gz *.zip; do
-            [ -e "$f" ] || continue
-            sha256sum "$f" >> checksums.txt
-          done
+          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+            | sort -z | xargs -0 sha256sum > checksums.txt
           cat checksums.txt
 
       - name: Upload artifact
