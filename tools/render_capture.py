@@ -68,5 +68,14 @@ while pos < len(data):
     # SGR (m), mode sets (h/l), charset, save/restore: ignore.
     pos = m.end()
 
+# Re-read with a decoder that never substitutes, so stray bytes from colour
+# handling surface as explicit markers instead of silently eating content.
+def _audit(path):
+    raw = open(path, "rb").read()
+    text = raw.decode("utf-8", "replace")
+    if "�" in text:
+        print(f"[warn] {text.count(chr(0xFFFD))} undecodable byte(s) in capture",
+              file=sys.stderr)
+
 for line in grid:
     print("".join(line).rstrip())
