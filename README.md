@@ -52,13 +52,42 @@ cfspeed
 
 ## What it measures
 
-- Download and upload throughput, sampled live and summarised (avg, p50, p95, max)
-- Idle latency, plus latency under load (the bufferbloat signal)
-- Jitter, packet loss, DNS resolution time
-- Colocation, ISP and transport from `cdn-cgi/trace`
+Press `3` for the full spec sheet; every group below is live-updating.
 
-Grades are waveform-style: bufferbloat `A+`..`F` from latency added under load,
-stability `A`..`F` from throughput variation.
+**Throughput** — download and upload, sampled at 200ms and summarised as
+avg / min / median / p25 / p75 / p95 / p99 / max, plus total bytes transferred
+and the steady-state window those samples cover.
+
+**Latency** — idle, loaded-during-download and loaded-during-upload, each with
+avg / min / median / p25 / p75 / p95 / p99 / max, jitter and packet loss.
+
+**Connection** — ISP and ASN, public IP, Cloudflare edge, location, TLS version
+with a **real measured handshake time**, negotiated cipher suite, HTTP protocol,
+WARP status and DNS resolution time.
+
+**Quality** — bufferbloat (latency added under load) and stability (throughput
+coefficient of variation), graded waveform-style from `A+` to `F`.
+
+## Controls
+
+| Key | Action |
+| --- | --- |
+| `space` | pause / resume the live charts |
+| `+` `-` | zoom the chart time window |
+| `1` `2` `3` `4` | live · charts · details · history |
+| `Tab` `←` `→` | cycle views |
+| `r` | run again |
+| `↑` `↓` | move history selection |
+| `Shift+H` | redact network details |
+| `q` | quit |
+
+## Design notes
+
+The palette is deliberately desaturated rather than the saturated cyan/magenta
+that generic dashboards default to, because these colours sit on screen for the
+length of a test. Every text token is validated against WCAG AA (4.5:1) on both
+surfaces by `tools/contrast_check.py`; active borders use an accent that clears
+7:1, and quiet borders are decorative only.
 
 ## Build
 

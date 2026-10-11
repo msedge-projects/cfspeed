@@ -129,25 +129,47 @@ pub struct Meta {
     pub http: String,
     #[serde(default)]
     pub dns_ms: f64,
+    /// Organisation name from `/meta` (e.g. the ISP).
+    #[serde(default)]
+    pub asn_org: String,
+    #[serde(default)]
+    pub asn: String,
+    /// Measured TLS handshake time and negotiated cipher.
+    #[serde(default)]
+    pub tls_ms: f64,
+    #[serde(default)]
+    pub tls_cipher: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LatencyStats {
     pub avg: f64,
+    pub min: f64,
     pub med: f64,
     pub p25: f64,
+    pub p75: f64,
     pub p95: f64,
+    pub p99: f64,
     pub max: f64,
     pub jitter: f64,
     pub loss: f64,
+    pub samples: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ThroughputStats {
     pub avg: f64,
+    pub min: f64,
     pub med: f64,
+    pub p25: f64,
+    pub p75: f64,
     pub p95: f64,
+    pub p99: f64,
     pub max: f64,
+    /// Total bytes transferred during the phase.
+    pub bytes: u64,
+    /// Steady-state duration the samples represent.
+    pub duration_ms: u64,
     pub samples: Vec<f64>,
 }
 
@@ -226,6 +248,11 @@ pub struct Runner {
 
 impl Runner {
     pub fn new(config: Config) -> Result<Self> {
+        // rustls panics inside `ClientConfig::builder()` unless a process-level
+        // crypto provider is installed. Doing it here means it is set up once,
+        // before any TLS work, and a repeated install is simply ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(16)
@@ -242,7 +269,102 @@ impl Runner {
         format!("{}/cdn-cgi/trace", self.config.base_url)
     }
 
-    /// Fetch connection metadata and DNS timing. Failures here are non-fatal.
+    fn meta_url(&self) -> String {
+        format!("{}/meta", self.config.base_url)
+    }
+
+    /// Pull the richer fields from `/meta` (ASN, org, city, protocol versions).
+    /// Best-effort: a failure here only costs us some detail rows.
+    async fn fetch_json_meta(&self, meta: &mut Meta) {
+        let Ok(resp) = self.client.get(self.meta_url()).send().await else {
+            return;
+        };
+        let Ok(v) = resp.json::<serde_json::Value>().await else {
+            return;
+        };
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        if let Some(org) = s("asOrganization") {
+            meta.asn_org = org;
+        }
+        if let Some(n) = v.get("asn").and_then(|x| x.as_u64()) {
+            meta.asn = n.to_string();
+        }
+        if let Some(c) = s("clientIp") {
+            meta.ip = c;
+        }
+        if let Some(c) = s("colo") {
+            meta.colo = c;
+        }
+        if let Some(c) = s("country") {
+            meta.loc = c;
+        }
+        if let Some(t) = s("tlsVersion") {
+            meta.tls = t;
+        }
+        if let Some(h) = s("httpProtocol") {
+            meta.http = h;
+        }
+    }
+
+    /// Time a real TLS handshake with rustls so the number reflects the actual
+    /// cipher negotiation rather than being inferred from the trace header.
+    async fn measure_tls(&self, host: &str, meta: &mut Meta) {
+        // Best-effort probe: every early exit just skips the TLS detail.
+        let Some((elapsed_ms, cipher)) = self.probe_tls(host).await else {
+            return;
+        };
+        meta.tls_ms = elapsed_ms;
+        meta.tls_cipher = cipher;
+    }
+
+    /// Returns `(handshake_ms, cipher_suite)` for a real TLS handshake.
+    async fn probe_tls(&self, host: &str) -> Option<(f64, String)> {
+        use std::sync::Arc as StdArc;
+
+        let mut addrs = tokio::net::lookup_host(format!("{host}:443")).await.ok()?;
+        // Prefer IPv4: it is the path the rest of the test will take, so this
+        // measures the handshake the user is really getting.
+        let addr = addrs.find(|a| a.is_ipv4())?;
+
+        let tcp =
+            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+                .await
+                .ok()?
+                .ok()?;
+        let _ = tcp.set_nodelay(true);
+
+        let connector = {
+            let mut roots = rustls::RootCertStore::empty();
+            // `CertificateResult` reports per-platform load errors separately
+            // from the certs that did load; partial success is fine here.
+            let certs = rustls_native_certs::load_native_certs().certs;
+            if certs.is_empty() {
+                return None;
+            }
+            roots.add_parsable_certificates(certs);
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tokio_rustls::TlsConnector::from(StdArc::new(config))
+        };
+
+        let name = rustls::pki_types::ServerName::try_from(host.to_string()).ok()?;
+
+        let started = Instant::now();
+        let tls = connector.connect(name, tcp).await.ok()?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let (_, session) = tls.get_ref();
+        let cipher = session
+            .negotiated_cipher_suite()
+            .map(|c| format!("{:?}", c.suite()))
+            .unwrap_or_default();
+        Some((elapsed_ms, cipher))
+    }
+
+    /// Fetch connection metadata, DNS timing and a real TLS handshake timing.
+    /// Every step is best-effort: a failure only costs us detail rows, never
+    /// the test itself.
     pub async fn fetch_meta(&self) -> Meta {
         let started = Instant::now();
         let dns_ms = tokio::time::timeout(Duration::from_secs(5), async {
@@ -256,37 +378,34 @@ impl Runner {
         .map(|_| started.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
 
-        let Ok(resp) = self.client.get(self.trace_url()).send().await else {
-            return Meta {
-                dns_ms,
-                ..Default::default()
-            };
-        };
-        let Ok(body) = resp.text().await else {
-            return Meta {
-                dns_ms,
-                ..Default::default()
-            };
-        };
-
         let mut meta = Meta {
             dns_ms,
             ..Default::default()
         };
-        for line in body.lines() {
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            match k {
-                "ip" => meta.ip = v.to_string(),
-                "colo" => meta.colo = v.to_string(),
-                "loc" => meta.loc = v.to_string(),
-                "tls" => meta.tls = v.to_string(),
-                "warp" => meta.warp = v.to_string(),
-                "http" => meta.http = v.to_string(),
-                _ => {}
+
+        if let Ok(resp) = self.client.get(self.trace_url()).send().await {
+            if let Ok(body) = resp.text().await {
+                for line in body.lines() {
+                    let Some((k, v)) = line.split_once('=') else {
+                        continue;
+                    };
+                    match k {
+                        "ip" => meta.ip = v.to_string(),
+                        "colo" => meta.colo = v.to_string(),
+                        "loc" => meta.loc = v.to_string(),
+                        "tls" => meta.tls = v.to_string(),
+                        "warp" => meta.warp = v.to_string(),
+                        "http" => meta.http = v.to_string(),
+                        _ => {}
+                    }
+                }
             }
         }
+
+        // `/meta` carries ASN, organisation and protocol details that the trace
+        // endpoint omits, so fetch it too and let it fill any gaps.
+        self.fetch_json_meta(&mut meta).await;
+        self.measure_tls("speed.cloudflare.com", &mut meta).await;
         meta
     }
 
@@ -485,7 +604,11 @@ async fn run_phase(
     let ramp = ((samples.len() as f64 * 0.2) as usize)
         .max(1)
         .min(samples.len());
-    let stats = summarise_throughput(&samples[ramp..]);
+    let stats = summarise_throughput(
+        &samples[ramp..],
+        counter.load(Ordering::Relaxed),
+        duration.as_millis() as u64,
+    );
     let lat = summarise_latency(&probe_samples);
     Ok((stats, lat))
 }
@@ -618,26 +741,40 @@ fn summarise_latency(samples: &[f64]) -> LatencyStats {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     LatencyStats {
         avg: good.iter().sum::<f64>() / good.len() as f64,
+        min: sorted.first().copied().unwrap_or(0.0),
         med: percentile(&sorted, 0.5),
         p25: percentile(&sorted, 0.25),
+        p75: percentile(&sorted, 0.75),
         p95: percentile(&sorted, 0.95),
+        p99: percentile(&sorted, 0.99),
         max: sorted.last().copied().unwrap_or(0.0),
         jitter: jitter(&good),
         loss,
+        samples: good.len(),
     }
 }
 
-fn summarise_throughput(samples: &[f64]) -> ThroughputStats {
+fn summarise_throughput(samples: &[f64], bytes: u64, duration_ms: u64) -> ThroughputStats {
     if samples.is_empty() {
-        return ThroughputStats::default();
+        return ThroughputStats {
+            bytes,
+            duration_ms,
+            ..Default::default()
+        };
     }
     let mut sorted = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     ThroughputStats {
         avg: samples.iter().sum::<f64>() / samples.len() as f64,
+        min: sorted.first().copied().unwrap_or(0.0),
         med: percentile(&sorted, 0.5),
+        p25: percentile(&sorted, 0.25),
+        p75: percentile(&sorted, 0.75),
         p95: percentile(&sorted, 0.95),
+        p99: percentile(&sorted, 0.99),
         max: sorted.last().copied().unwrap_or(0.0),
+        bytes,
+        duration_ms,
         samples: samples.to_vec(),
     }
 }
@@ -695,5 +832,43 @@ mod tests {
         let s = summarise_latency(&[10.0, -1.0, 20.0, -1.0]);
         assert!((s.loss - 50.0).abs() < 1e-9);
         assert!((s.avg - 15.0).abs() < 1e-9);
+        assert_eq!(s.samples, 2, "dropped probes must not count as samples");
+    }
+
+    #[test]
+    fn latency_summary_fills_the_full_percentile_set() {
+        let s = summarise_latency(&[10.0, 20.0, 30.0, 40.0]);
+        assert!((s.min - 10.0).abs() < 1e-9);
+        assert!((s.max - 40.0).abs() < 1e-9);
+        assert!((s.p25 - 17.5).abs() < 1e-9);
+        assert!((s.p75 - 32.5).abs() < 1e-9);
+        assert!((s.p99 - 39.7).abs() < 1e-6);
+        assert_eq!(s.samples, 4);
+    }
+
+    #[test]
+    fn latency_summary_handles_all_lost_probes() {
+        let s = summarise_latency(&[-1.0, -1.0]);
+        assert!((s.loss - 100.0).abs() < 1e-9);
+        assert_eq!(s.avg, 0.0);
+    }
+
+    #[test]
+    fn throughput_summary_reports_bytes_and_window() {
+        let s = summarise_throughput(&[10.0, 20.0, 30.0], 123_456, 8_000);
+        assert_eq!(s.bytes, 123_456);
+        assert_eq!(s.duration_ms, 8_000);
+        assert!((s.avg - 20.0).abs() < 1e-9);
+        assert!((s.min - 10.0).abs() < 1e-9);
+        assert!((s.max - 30.0).abs() < 1e-9);
+        assert_eq!(s.samples.len(), 3);
+    }
+
+    #[test]
+    fn throughput_summary_keeps_totals_when_no_samples() {
+        let s = summarise_throughput(&[], 999, 4_000);
+        assert_eq!(s.bytes, 999, "bytes are counted even without samples");
+        assert_eq!(s.samples.len(), 0);
+        assert_eq!(s.avg, 0.0);
     }
 }

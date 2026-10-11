@@ -12,7 +12,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::{App, View};
-use crate::speed::{bufferbloat_grade, cv_percent, median, percentile, stability_grade, Phase};
+use crate::speed::{
+    bufferbloat_grade, cv_percent, median, percentile, stability_grade, LatencyStats, Phase,
+};
 use crate::ui::charts::{format_mbps, meter, render_area, ChartStyle};
 use crate::ui::theme::{self, ACCENT_DOWN, ACCENT_LAT, ACCENT_UP};
 use crate::ui::widgets::{card, dial, pill, tile_lines};
@@ -51,6 +53,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.view {
         View::Live => live(frame, rows[2], app),
         View::Charts => charts(frame, rows[2], app),
+        View::Details => details(frame, rows[2], app),
         View::History => history(frame, rows[2], app),
         View::Help => help(frame, rows[2], app),
     }
@@ -139,10 +142,13 @@ fn key_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), line[0]);
 
     let mut keys = vec![
+        kbd("space"),
+        Span::raw(if app.paused { " resume  " } else { " pause  " }),
+        kbd("+"),
+        Span::raw("-"),
+        Span::raw(format!(" zoom ({})  ", app.zoom.label())),
         kbd("r"),
         Span::raw(" run  "),
-        kbd("Tab"),
-        Span::raw(" view  "),
     ];
     if let Some(e) = &app.error {
         keys.push(Span::styled(
@@ -286,9 +292,10 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         "↓",
         "DOWNLOAD",
         ACCENT_DOWN,
-        &app.down_samples,
+        app.window(&app.down_samples),
         app.down_scaler.value(),
         app.phase == Phase::Download,
+        app.paused,
     );
     phase_card(
         frame,
@@ -296,9 +303,10 @@ fn live(frame: &mut Frame, area: Rect, app: &App) {
         "↑",
         "UPLOAD",
         ACCENT_UP,
-        &app.up_samples,
+        app.window(&app.up_samples),
         app.up_scaler.value(),
         app.phase == Phase::Upload,
+        app.paused,
     );
 }
 
@@ -312,6 +320,7 @@ fn phase_card(
     samples: &[f64],
     scale_max: f64,
     active: bool,
+    paused: bool,
 ) {
     if area.width < 20 || area.height < 10 {
         return;
@@ -412,6 +421,22 @@ fn phase_card(
         },
         true,
     );
+    if paused {
+        // A pause badge makes the frozen state obvious rather than looking like
+        // a stalled connection.
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " PAUSED ",
+                Style::default().fg(theme::SURFACE).bg(theme::TEXT_BRIGHT),
+            )),
+            Rect {
+                x: rows[2].x + rows[2].width.saturating_sub(8),
+                y: rows[2].y,
+                width: 8,
+                height: 1,
+            },
+        );
+    }
 
     // 4. Summary.
     let (_, p95, peak) = sample_stats(samples);
@@ -432,6 +457,254 @@ fn phase_card(
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(summary)), rows[3]);
+}
+
+// ---------------------------------------------------------------------------
+// Details view - every metric we measured, grouped like a spec sheet
+// ---------------------------------------------------------------------------
+
+fn details(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width < 30 || area.height < 8 {
+        return;
+    }
+    let inner = card(frame, area, ACCENT_LAT, false);
+
+    let mut groups: Vec<(&str, Vec<(String, String, Color)>)> = Vec::new();
+
+    // --- Connection -------------------------------------------------------
+    let m = &app.meta;
+    let mut conn: Vec<(String, String, Color)> = Vec::new();
+    if app.hide_info {
+        conn.push(("privacy".into(), "hidden (Shift+H)".into(), theme::TEXT_DIM));
+    } else {
+        if !m.asn_org.is_empty() {
+            conn.push(("ISP".into(), m.asn_org.clone(), theme::TEXT));
+        }
+        if !m.asn.is_empty() {
+            conn.push(("ASN".into(), m.asn.clone(), theme::TEXT));
+        }
+        if !m.ip.is_empty() {
+            conn.push(("Public IP".into(), m.ip.clone(), theme::TEXT));
+        }
+        if !m.colo.is_empty() {
+            conn.push(("Edge".into(), m.colo.clone(), theme::TEXT));
+        }
+        if !m.loc.is_empty() {
+            conn.push(("Location".into(), m.loc.clone(), theme::TEXT));
+        }
+    }
+    if !m.tls.is_empty() {
+        conn.push((
+            "TLS".into(),
+            format!(
+                "{}{}",
+                m.tls,
+                if m.tls_ms > 0.0 {
+                    format!("  ({:.0}ms)", m.tls_ms)
+                } else {
+                    String::new()
+                }
+            ),
+            theme::TEXT,
+        ));
+    }
+    if !m.tls_cipher.is_empty() {
+        conn.push(("Cipher".into(), m.tls_cipher.clone(), theme::TEXT_DIM));
+    }
+    if !m.http.is_empty() {
+        conn.push(("HTTP".into(), m.http.clone(), theme::TEXT));
+    }
+    if !m.warp.is_empty() {
+        conn.push((
+            "WARP".into(),
+            m.warp.clone(),
+            if m.warp == "off" {
+                theme::TEXT_DIM
+            } else {
+                theme::grade_color("A")
+            },
+        ));
+    }
+    if m.dns_ms > 0.0 {
+        conn.push(("DNS".into(), fmt_ms(m.dns_ms), theme::TEXT));
+    }
+    groups.push(("CONNECTION", conn));
+
+    // --- Throughput -------------------------------------------------------
+    let mut tp: Vec<(String, String, Color)> = Vec::new();
+    match &app.result {
+        Some(r) => {
+            for (name, t, color) in [
+                ("Download", &r.download, ACCENT_DOWN),
+                ("Upload", &r.upload, ACCENT_UP),
+            ] {
+                tp.push((format!("{name} avg"), format_mbps(t.avg), color));
+                tp.push((format!("{name} median"), format_mbps(t.med), color));
+                tp.push((
+                    format!("{name} p25/p75"),
+                    format!("{}/{}", format_mbps(t.p25), format_mbps(t.p75)),
+                    theme::TEXT_DIM,
+                ));
+                tp.push((format!("{name} p95"), format_mbps(t.p95), color));
+                tp.push((format!("{name} p99"), format_mbps(t.p99), color));
+                tp.push((
+                    format!("{name} min/max"),
+                    format!("{}/{}", format_mbps(t.min), format_mbps(t.max)),
+                    theme::TEXT_DIM,
+                ));
+                tp.push((format!("{name} data"), format_bytes(t.bytes), theme::TEXT));
+                tp.push((
+                    format!("{name} window"),
+                    format!("{}s  ({} samples)", t.duration_ms / 1000, t.samples.len()),
+                    theme::TEXT_DIM,
+                ));
+            }
+        }
+        None => {
+            // Mid-run: show what has accumulated so far.
+            for (name, samples, color) in [
+                ("Download", &app.down_samples, ACCENT_DOWN),
+                ("Upload", &app.up_samples, ACCENT_UP),
+            ] {
+                let (avg, _, peak) = sample_stats(samples);
+                tp.push((format!("{name} avg"), format_mbps(avg), color));
+                tp.push((format!("{name} peak"), format_mbps(peak), color));
+                tp.push((
+                    format!("{name} samples"),
+                    format!("{}", samples.len()),
+                    theme::TEXT_DIM,
+                ));
+            }
+        }
+    }
+    groups.push(("THROUGHPUT", tp));
+
+    // --- Latency ----------------------------------------------------------
+    let mut lat: Vec<(String, String, Color)> = Vec::new();
+    for (name, s) in [
+        ("Idle", &app.idle),
+        ("Loaded ↓", &loaded_down(app)),
+        ("Loaded ↑", &loaded_up(app)),
+    ] {
+        if s.avg <= 0.0 {
+            continue;
+        }
+        lat.push((format!("{name} avg"), fmt_ms(s.avg), theme::TEXT));
+        lat.push((
+            format!("{name} min/med"),
+            format!("{}/{}", fmt_ms(s.min), fmt_ms(s.med)),
+            theme::TEXT,
+        ));
+        lat.push((
+            format!("{name} p25/p75"),
+            format!("{}/{}", fmt_ms(s.p25), fmt_ms(s.p75)),
+            theme::TEXT_DIM,
+        ));
+        lat.push((
+            format!("{name} p95/p99"),
+            format!("{}/{}", fmt_ms(s.p95), fmt_ms(s.p99)),
+            theme::TEXT_DIM,
+        ));
+        lat.push((format!("{name} max"), fmt_ms(s.max), theme::TEXT));
+        lat.push((format!("{name} jitter"), fmt_ms(s.jitter), theme::TEXT));
+        lat.push((
+            format!("{name} loss"),
+            format!("{:.1}%", s.loss),
+            theme::TEXT,
+        ));
+    }
+    groups.push(("LATENCY", lat));
+
+    // --- Quality ----------------------------------------------------------
+    let mut q: Vec<(String, String, Color)> = Vec::new();
+    if let Some(qual) = app.quality() {
+        q.push((
+            "Bufferbloat".into(),
+            format!("{}  +{:.0}ms", qual.bufferbloat, qual.bufferbloat_ms),
+            theme::grade_color(qual.bufferbloat),
+        ));
+        q.push((
+            "Stability".into(),
+            format!("{}  CV {:.0}%", qual.stability, qual.stability_cv),
+            theme::grade_color(qual.stability),
+        ));
+    }
+    q.push(("Run time".into(), fmt_dur(app.elapsed), theme::TEXT));
+    groups.push(("QUALITY", q));
+
+    // --- Render as a two-column spec sheet --------------------------------
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 2),
+            Constraint::Length(1),
+            Constraint::Ratio(1, 2),
+        ])
+        .split(inner);
+    render_spec_sheet(frame, cols[0], &groups[..2.min(groups.len())]);
+    render_spec_sheet(frame, cols[2], &groups[2.min(groups.len())..]);
+}
+
+fn render_spec_sheet(
+    frame: &mut Frame,
+    area: Rect,
+    groups: &[(&str, Vec<(String, String, Color)>)],
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    // Keep labels to a common width so values line up into a readable column.
+    let label_w = groups
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .map(|(l, _, _)| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(12, 20);
+
+    let mut lines = Vec::new();
+    for (title, rows) in groups {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {title}"),
+            Style::default().fg(ACCENT_LAT).add_modifier(Modifier::BOLD),
+        )));
+        if rows.is_empty() {
+            // Always show the group with an explicit placeholder rather than
+            // silently collapsing, so a missing measurement reads as "not
+            // measured" instead of "not applicable".
+            lines.push(Line::from(Span::styled(
+                "   not measured yet",
+                Style::default()
+                    .fg(theme::TEXT_DIM)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+            continue;
+        }
+        for (label, value, color) in rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {label:<label_w$}  "), theme::style_label()),
+                Span::styled(value.clone(), Style::default().fg(*color)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn loaded_down(app: &App) -> LatencyStats {
+    app.result
+        .as_ref()
+        .map(|r| r.loaded_down.clone())
+        .unwrap_or_default()
+}
+
+fn loaded_up(app: &App) -> LatencyStats {
+    app.result
+        .as_ref()
+        .map(|r| r.loaded_up.clone())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -643,12 +916,16 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
     let inner = card(frame, area, ACCENT_DOWN, false);
     let bindings: Vec<(&str, &str)> = vec![
         ("q / Esc", "quit"),
+        ("Ctrl+C", "force quit"),
         ("r", "run a new test"),
-        ("1 2 3 4", "live · charts · history · help"),
+        ("space", "pause / resume the live charts"),
+        ("+ / -", "zoom the chart time window"),
+        ("1 2 3 4", "live · charts · details · history"),
+        ("?", "help"),
         ("Tab / Shift+Tab", "cycle views"),
+        ("← →", "previous / next view"),
         ("↑ ↓ / j k", "move history selection"),
         ("Shift+H", "toggle network privacy"),
-        ("Ctrl+C", "force quit"),
     ];
 
     let mut lines = vec![
@@ -680,6 +957,10 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
             "  chart - 8x the vertical resolution of a character sparkline.",
             theme::style_label(),
         )),
+        Line::from(Span::styled(
+            "  Press 3 for every metric we collect, as a spec sheet.",
+            theme::style_label(),
+        )),
         Line::default(),
         Line::from(Span::styled(
             format!("  {} saved run(s) in history", app.history.len()),
@@ -692,6 +973,21 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
+
+fn format_bytes(b: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let v = b as f64;
+    if v >= GB {
+        format!("{:.2} GB", v / GB)
+    } else if v >= MB {
+        format!("{:.1} MB", v / MB)
+    } else if v >= 1024.0 {
+        format!("{:.1} KB", v / 1024.0)
+    } else {
+        format!("{b} B")
+    }
+}
 
 fn fmt_dur(d: std::time::Duration) -> String {
     let s = d.as_secs();
@@ -829,6 +1125,75 @@ mod tests {
     fn latency_scaling_is_clamped() {
         let out = scaled(&[50.0, 100.0, 400.0], 0.0, 200.0);
         assert_eq!(out[2], 200.0, "above-range values clamp to the ceiling");
+    }
+
+    #[test]
+    fn bytes_scale_to_the_right_unit() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    /// Every metric group must render its heading even with no data yet, so the
+    /// panel never collapses to an empty card.
+    #[test]
+    fn details_view_renders_all_group_headings() {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut app = App::new();
+        app.history.clear();
+        app.view = View::Details;
+        terminal
+            .draw(|f| draw(f, &app))
+            .expect("draw must not panic on the details view");
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for heading in ["CONNECTION", "THROUGHPUT", "LATENCY", "QUALITY"] {
+            assert!(text.contains(heading), "details view missing {heading}");
+        }
+    }
+
+    /// Every view must survive a draw, including at the minimum supported size.
+    #[test]
+    fn every_view_renders_at_minimum_size() {
+        for view in View::ALL {
+            let backend = ratatui::backend::TestBackend::new(MIN_WIDTH, MIN_HEIGHT);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            let mut app = App::new();
+            app.history.clear();
+            app.view = view;
+            terminal
+                .draw(|f| draw(f, &app))
+                .unwrap_or_else(|e| panic!("{view:?} failed to draw: {e}"));
+        }
+    }
+
+    #[test]
+    fn tiny_terminal_shows_a_hint_instead_of_corrupting() {
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let app = App::new();
+        terminal.draw(|f| draw(f, &app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("too small"), "expected a size hint");
     }
 
     #[test]

@@ -17,20 +17,65 @@ const MAX_POINTS: usize = 1200;
 pub enum View {
     Live,
     Charts,
+    Details,
     History,
     Help,
 }
 
 impl View {
-    pub const ALL: [View; 4] = [View::Live, View::Charts, View::History, View::Help];
+    pub const ALL: [View; 5] = [
+        View::Live,
+        View::Charts,
+        View::Details,
+        View::History,
+        View::Help,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             View::Live => "LIVE",
             View::Charts => "CHARTS",
+            View::Details => "DETAILS",
             View::History => "HISTORY",
             View::Help => "HELP",
         }
+    }
+}
+
+/// Visible time span of the live charts, in samples. Toggled with `+` / `-`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Zoom(pub usize);
+
+impl Zoom {
+    /// Window choices in samples; each sample is ~200ms, so these run from
+    /// ~10s up to the full retained history.
+    pub const STEPS: [usize; 5] = [50, 100, 250, 500, 1200];
+
+    pub fn index(&self) -> usize {
+        Self::STEPS
+            .iter()
+            .position(|s| *s == self.0)
+            .unwrap_or(Self::STEPS.len() - 1)
+    }
+
+    pub fn widen(&mut self) {
+        let i = (self.index() + 1).min(Self::STEPS.len() - 1);
+        self.0 = Self::STEPS[i];
+    }
+
+    pub fn narrow(&mut self) {
+        let i = self.index().saturating_sub(1);
+        self.0 = Self::STEPS[i];
+    }
+
+    pub fn label(&self) -> String {
+        format!("{:.0}s window", self.0 as f64 * 0.2)
+    }
+}
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Self(Self::STEPS[Self::STEPS.len() - 1])
     }
 }
 
@@ -56,6 +101,11 @@ pub struct App {
     pub started: Option<Instant>,
     pub elapsed: Duration,
     pub hide_info: bool,
+
+    /// Freezes chart updates without stopping the measurement, so a number can
+    /// be read off the screen without it racing away.
+    pub paused: bool,
+    pub zoom: Zoom,
 
     pub status: String,
     pub error: Option<String>,
@@ -83,6 +133,8 @@ impl App {
             started: None,
             elapsed: Duration::ZERO,
             hide_info: false,
+            paused: false,
+            zoom: Zoom::default(),
             status: String::new(),
             error: None,
             restart: false,
@@ -197,8 +249,9 @@ impl App {
 
             KeyCode::Char('1') => self.view = View::Live,
             KeyCode::Char('2') => self.view = View::Charts,
-            KeyCode::Char('3') => self.view = View::History,
-            KeyCode::Char('?') | KeyCode::Char('h') => self.view = View::Help,
+            KeyCode::Char('3') => self.view = View::Details,
+            KeyCode::Char('4') => self.view = View::History,
+            KeyCode::Char('?') => self.view = View::Help,
 
             KeyCode::Tab | KeyCode::Right => {
                 let i = View::ALL.iter().position(|v| *v == self.view).unwrap_or(0);
@@ -211,11 +264,23 @@ impl App {
 
             KeyCode::Char('H') => self.hide_info = !self.hide_info,
 
+            // Pause freezes the charts; the measurement keeps running so the
+            // number can be read at leisure.
+            KeyCode::Char(' ') => self.paused = !self.paused,
+            KeyCode::Char('+') | KeyCode::Char('=') => self.zoom.widen(),
+            KeyCode::Char('-') | KeyCode::Char('_') => self.zoom.narrow(),
+
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
 
             _ => {}
         }
+    }
+
+    /// Samples limited to the current zoom window.
+    pub fn window<'a>(&self, samples: &'a [f64]) -> &'a [f64] {
+        let n = self.zoom.0.min(samples.len());
+        &samples[samples.len() - n..]
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -344,5 +409,81 @@ mod tests {
     fn quality_absent_before_completion() {
         let a = app();
         assert!(a.quality().is_none());
+    }
+
+    #[test]
+    fn space_toggles_pause() {
+        let mut a = app();
+        assert!(!a.paused);
+        a.on_key(press(' '));
+        assert!(a.paused);
+        a.on_key(press(' '));
+        assert!(!a.paused);
+    }
+
+    #[test]
+    fn zoom_starts_wide_and_narrows_bounded() {
+        let mut a = app();
+        assert_eq!(a.zoom.0, Zoom::STEPS[Zoom::STEPS.len() - 1]);
+        a.on_key(press('-'));
+        assert!(a.zoom.0 < Zoom::STEPS[Zoom::STEPS.len() - 1]);
+        // Cannot narrow past the smallest window.
+        for _ in 0..10 {
+            a.on_key(press('-'));
+        }
+        assert_eq!(a.zoom.0, Zoom::STEPS[0]);
+        // ...nor widen past the largest.
+        for _ in 0..10 {
+            a.on_key(press('+'));
+        }
+        assert_eq!(a.zoom.0, Zoom::STEPS[Zoom::STEPS.len() - 1]);
+    }
+
+    #[test]
+    fn window_returns_the_most_recent_samples() {
+        let mut a = app();
+        a.zoom = Zoom(50);
+        a.down_samples = (0..200).map(|i| i as f64).collect();
+        let w = a.window(&a.down_samples);
+        assert_eq!(w.len(), 50);
+        assert_eq!(w[49], 199.0, "window must end at the newest sample");
+    }
+
+    #[test]
+    fn window_tolerates_short_history() {
+        let a = app();
+        let short = [1.0, 2.0];
+        assert_eq!(a.window(&short).len(), 2);
+        assert_eq!(a.window(&[]).len(), 0);
+    }
+
+    #[test]
+    fn details_view_is_reachable_by_number_key() {
+        let mut a = app();
+        a.on_key(press('3'));
+        assert_eq!(a.view, View::Details);
+        a.on_key(press('1'));
+        assert_eq!(a.view, View::Live);
+    }
+
+    /// Build a Press key event; Windows emits Release too, which must be ignored.
+    fn press(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE,
+        )
+    }
+
+    #[test]
+    fn key_releases_are_ignored() {
+        let mut a = app();
+        a.view = View::Charts;
+        let mut release = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('1'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        release.kind = crossterm::event::KeyEventKind::Release;
+        a.on_key(release);
+        assert_eq!(a.view, View::Charts, "a Release must not switch views");
     }
 }

@@ -24,6 +24,11 @@ serde_json = "1.0"
 bytes = "1"
 rand = "0.8"
 
+# Real TLS handshake timing (cipher negotiation) for the diagnostics panel.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
