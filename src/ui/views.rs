@@ -463,97 +463,124 @@ fn phase_card(
 // Details view - every metric we measured, grouped like a spec sheet
 // ---------------------------------------------------------------------------
 
+/// One labelled measurement in the spec sheet.
+struct Metric {
+    label: String,
+    value: String,
+    color: Color,
+}
+
+impl Metric {
+    fn new(label: impl Into<String>, value: impl Into<String>, color: Color) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+            color,
+        }
+    }
+}
+
 fn details(frame: &mut Frame, area: Rect, app: &App) {
     if area.width < 30 || area.height < 8 {
         return;
     }
     let inner = card(frame, area, ACCENT_LAT, false);
 
-    let mut groups: Vec<(&str, Vec<(String, String, Color)>)> = Vec::new();
+    let mut groups: Vec<(&str, Vec<Metric>)> = Vec::new();
 
     // --- Connection -------------------------------------------------------
     let m = &app.meta;
-    let mut conn: Vec<(String, String, Color)> = Vec::new();
+    let mut conn: Vec<Metric> = Vec::new();
     if app.hide_info {
-        conn.push(("privacy".into(), "hidden (Shift+H)".into(), theme::TEXT_DIM));
+        conn.push(Metric::new("privacy", "hidden (Shift+H)", theme::TEXT_DIM));
     } else {
         if !m.asn_org.is_empty() {
-            conn.push(("ISP".into(), m.asn_org.clone(), theme::TEXT));
+            conn.push(Metric::new("ISP", &m.asn_org, theme::TEXT));
         }
         if !m.asn.is_empty() {
-            conn.push(("ASN".into(), m.asn.clone(), theme::TEXT));
+            conn.push(Metric::new("ASN", &m.asn, theme::TEXT));
         }
         if !m.ip.is_empty() {
-            conn.push(("Public IP".into(), m.ip.clone(), theme::TEXT));
+            conn.push(Metric::new("Public IP", &m.ip, theme::TEXT));
         }
         if !m.colo.is_empty() {
-            conn.push(("Edge".into(), m.colo.clone(), theme::TEXT));
+            conn.push(Metric::new("Edge", &m.colo, theme::TEXT));
         }
         if !m.loc.is_empty() {
-            conn.push(("Location".into(), m.loc.clone(), theme::TEXT));
+            conn.push(Metric::new("Location", &m.loc, theme::TEXT));
         }
     }
     if !m.tls.is_empty() {
-        conn.push((
-            "TLS".into(),
-            format!(
-                "{}{}",
-                m.tls,
-                if m.tls_ms > 0.0 {
-                    format!("  ({:.0}ms)", m.tls_ms)
-                } else {
-                    String::new()
-                }
-            ),
-            theme::TEXT,
-        ));
+        let extra = if m.tls_ms > 0.0 {
+            format!("  ({:.0}ms)", m.tls_ms)
+        } else {
+            String::new()
+        };
+        conn.push(Metric::new("TLS", format!("{}{extra}", m.tls), theme::TEXT));
     }
     if !m.tls_cipher.is_empty() {
-        conn.push(("Cipher".into(), m.tls_cipher.clone(), theme::TEXT_DIM));
+        conn.push(Metric::new("Cipher", &m.tls_cipher, theme::TEXT_DIM));
     }
     if !m.http.is_empty() {
-        conn.push(("HTTP".into(), m.http.clone(), theme::TEXT));
+        conn.push(Metric::new("HTTP", &m.http, theme::TEXT));
     }
     if !m.warp.is_empty() {
-        conn.push((
-            "WARP".into(),
-            m.warp.clone(),
-            if m.warp == "off" {
-                theme::TEXT_DIM
-            } else {
-                theme::grade_color("A")
-            },
-        ));
+        let c = if m.warp == "off" {
+            theme::TEXT_DIM
+        } else {
+            theme::grade_color("A")
+        };
+        conn.push(Metric::new("WARP", &m.warp, c));
     }
     if m.dns_ms > 0.0 {
-        conn.push(("DNS".into(), fmt_ms(m.dns_ms), theme::TEXT));
+        conn.push(Metric::new("DNS", fmt_ms(m.dns_ms), theme::TEXT));
     }
     groups.push(("CONNECTION", conn));
 
     // --- Throughput -------------------------------------------------------
-    let mut tp: Vec<(String, String, Color)> = Vec::new();
+    let mut tp: Vec<Metric> = Vec::new();
     match &app.result {
         Some(r) => {
             for (name, t, color) in [
                 ("Download", &r.download, ACCENT_DOWN),
                 ("Upload", &r.upload, ACCENT_UP),
             ] {
-                tp.push((format!("{name} avg"), format_mbps(t.avg), color));
-                tp.push((format!("{name} median"), format_mbps(t.med), color));
-                tp.push((
+                tp.push(Metric::new(
+                    format!("{name} avg"),
+                    format_mbps(t.avg),
+                    color,
+                ));
+                tp.push(Metric::new(
+                    format!("{name} median"),
+                    format_mbps(t.med),
+                    color,
+                ));
+                tp.push(Metric::new(
                     format!("{name} p25/p75"),
                     format!("{}/{}", format_mbps(t.p25), format_mbps(t.p75)),
                     theme::TEXT_DIM,
                 ));
-                tp.push((format!("{name} p95"), format_mbps(t.p95), color));
-                tp.push((format!("{name} p99"), format_mbps(t.p99), color));
-                tp.push((
+                tp.push(Metric::new(
+                    format!("{name} p95"),
+                    format_mbps(t.p95),
+                    color,
+                ));
+                tp.push(Metric::new(
+                    format!("{name} p99"),
+                    format_mbps(t.p99),
+                    color,
+                ));
+                tp.push(Metric::new(
                     format!("{name} min/max"),
                     format!("{}/{}", format_mbps(t.min), format_mbps(t.max)),
                     theme::TEXT_DIM,
                 ));
-                tp.push((format!("{name} data"), format_bytes(t.bytes), theme::TEXT));
-                tp.push((
+                tp.push(Metric::new(
+                    format!("{name} data"),
+                    format_bytes(t.bytes),
+                    theme::TEXT,
+                ));
+                tp.push(Metric::new(
                     format!("{name} window"),
                     format!("{}s  ({} samples)", t.duration_ms / 1000, t.samples.len()),
                     theme::TEXT_DIM,
@@ -567,11 +594,15 @@ fn details(frame: &mut Frame, area: Rect, app: &App) {
                 ("Upload", &app.up_samples, ACCENT_UP),
             ] {
                 let (avg, _, peak) = sample_stats(samples);
-                tp.push((format!("{name} avg"), format_mbps(avg), color));
-                tp.push((format!("{name} peak"), format_mbps(peak), color));
-                tp.push((
+                tp.push(Metric::new(format!("{name} avg"), format_mbps(avg), color));
+                tp.push(Metric::new(
+                    format!("{name} peak"),
+                    format_mbps(peak),
+                    color,
+                ));
+                tp.push(Metric::new(
                     format!("{name} samples"),
-                    format!("{}", samples.len()),
+                    samples.len().to_string(),
                     theme::TEXT_DIM,
                 ));
             }
@@ -580,34 +611,46 @@ fn details(frame: &mut Frame, area: Rect, app: &App) {
     groups.push(("THROUGHPUT", tp));
 
     // --- Latency ----------------------------------------------------------
-    let mut lat: Vec<(String, String, Color)> = Vec::new();
+    let mut lat: Vec<Metric> = Vec::new();
     for (name, s) in [
         ("Idle", &app.idle),
-        ("Loaded ↓", &loaded_down(app)),
-        ("Loaded ↑", &loaded_up(app)),
+        ("Loaded down", &loaded_down(app)),
+        ("Loaded up", &loaded_up(app)),
     ] {
         if s.avg <= 0.0 {
             continue;
         }
-        lat.push((format!("{name} avg"), fmt_ms(s.avg), theme::TEXT));
-        lat.push((
+        lat.push(Metric::new(
+            format!("{name} avg"),
+            fmt_ms(s.avg),
+            theme::TEXT,
+        ));
+        lat.push(Metric::new(
             format!("{name} min/med"),
             format!("{}/{}", fmt_ms(s.min), fmt_ms(s.med)),
             theme::TEXT,
         ));
-        lat.push((
+        lat.push(Metric::new(
             format!("{name} p25/p75"),
             format!("{}/{}", fmt_ms(s.p25), fmt_ms(s.p75)),
             theme::TEXT_DIM,
         ));
-        lat.push((
+        lat.push(Metric::new(
             format!("{name} p95/p99"),
             format!("{}/{}", fmt_ms(s.p95), fmt_ms(s.p99)),
             theme::TEXT_DIM,
         ));
-        lat.push((format!("{name} max"), fmt_ms(s.max), theme::TEXT));
-        lat.push((format!("{name} jitter"), fmt_ms(s.jitter), theme::TEXT));
-        lat.push((
+        lat.push(Metric::new(
+            format!("{name} max"),
+            fmt_ms(s.max),
+            theme::TEXT,
+        ));
+        lat.push(Metric::new(
+            format!("{name} jitter"),
+            fmt_ms(s.jitter),
+            theme::TEXT,
+        ));
+        lat.push(Metric::new(
             format!("{name} loss"),
             format!("{:.1}%", s.loss),
             theme::TEXT,
@@ -616,20 +659,20 @@ fn details(frame: &mut Frame, area: Rect, app: &App) {
     groups.push(("LATENCY", lat));
 
     // --- Quality ----------------------------------------------------------
-    let mut q: Vec<(String, String, Color)> = Vec::new();
+    let mut q: Vec<Metric> = Vec::new();
     if let Some(qual) = app.quality() {
-        q.push((
-            "Bufferbloat".into(),
+        q.push(Metric::new(
+            "Bufferbloat",
             format!("{}  +{:.0}ms", qual.bufferbloat, qual.bufferbloat_ms),
             theme::grade_color(qual.bufferbloat),
         ));
-        q.push((
-            "Stability".into(),
+        q.push(Metric::new(
+            "Stability",
             format!("{}  CV {:.0}%", qual.stability, qual.stability_cv),
             theme::grade_color(qual.stability),
         ));
     }
-    q.push(("Run time".into(), fmt_dur(app.elapsed), theme::TEXT));
+    q.push(Metric::new("Run time", fmt_dur(app.elapsed), theme::TEXT));
     groups.push(("QUALITY", q));
 
     // --- Render as a two-column spec sheet --------------------------------
@@ -645,11 +688,7 @@ fn details(frame: &mut Frame, area: Rect, app: &App) {
     render_spec_sheet(frame, cols[2], &groups[2.min(groups.len())..]);
 }
 
-fn render_spec_sheet(
-    frame: &mut Frame,
-    area: Rect,
-    groups: &[(&str, Vec<(String, String, Color)>)],
-) {
+fn render_spec_sheet(frame: &mut Frame, area: Rect, groups: &[(&str, Vec<Metric>)]) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -657,7 +696,7 @@ fn render_spec_sheet(
     let label_w = groups
         .iter()
         .flat_map(|(_, rows)| rows.iter())
-        .map(|(l, _, _)| l.chars().count())
+        .map(|m| m.label.chars().count())
         .max()
         .unwrap_or(0)
         .clamp(12, 20);
@@ -683,10 +722,10 @@ fn render_spec_sheet(
             )));
             continue;
         }
-        for (label, value, color) in rows {
+        for m in rows {
             lines.push(Line::from(vec![
-                Span::styled(format!("   {label:<label_w$}  "), theme::style_label()),
-                Span::styled(value.clone(), Style::default().fg(*color)),
+                Span::styled(format!("   {:<label_w$}  ", m.label), theme::style_label()),
+                Span::styled(m.value.clone(), Style::default().fg(m.color)),
             ]));
         }
     }
