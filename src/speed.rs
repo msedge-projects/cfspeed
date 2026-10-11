@@ -4,7 +4,7 @@
 //! cadence so the UI has a smooth signal to graph, rather than one number at
 //! the end of a phase.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -196,6 +196,9 @@ pub struct Config {
     pub upload_duration: Duration,
     pub concurrency: usize,
     pub sample_interval: Duration,
+    /// Preferred bytes per download request. Cloudflare rate-limits large
+    /// payloads (HTTP 429), so the workers start here and adapt downwards.
+    pub download_chunk: usize,
 }
 
 impl Default for Config {
@@ -207,6 +210,7 @@ impl Default for Config {
             upload_duration: Duration::from_secs(10),
             concurrency: 6,
             sample_interval: Duration::from_millis(200),
+            download_chunk: 1_000_000,
         }
     }
 }
@@ -335,6 +339,7 @@ impl Runner {
                 sample_interval: self.config.sample_interval,
                 phase: Phase::Download,
                 dir: Direction::Down,
+                download_chunk: self.config.download_chunk,
             },
             tx,
         )
@@ -348,6 +353,7 @@ impl Runner {
                 sample_interval: self.config.sample_interval,
                 phase: Phase::Upload,
                 dir: Direction::Up,
+                download_chunk: self.config.download_chunk,
             },
             tx,
         )
@@ -389,6 +395,7 @@ struct PhaseSpec<'a> {
     sample_interval: Duration,
     phase: Phase,
     dir: Direction,
+    download_chunk: usize,
 }
 
 /// Run one throughput phase, emitting `Tick`s while it runs.
@@ -407,10 +414,13 @@ async fn run_phase(
         sample_interval,
         phase,
         dir,
+        download_chunk,
     } = spec;
 
     let _ = tx.send(Event::Phase(phase));
     let counter = Arc::new(AtomicU64::new(0));
+    // Shared across workers so they collectively back off when rate limited.
+    let chunk = Arc::new(AtomicUsize::new(download_chunk));
     let deadline = Instant::now() + duration;
 
     let mut handles = Vec::with_capacity(concurrency.max(1));
@@ -418,9 +428,10 @@ async fn run_phase(
         let counter = Arc::clone(&counter);
         let client = client.clone();
         let base = base_url.to_string();
+        let chunk = Arc::clone(&chunk);
         handles.push(tokio::spawn(async move {
             match dir {
-                Direction::Down => download_worker(client, &base, counter, deadline).await,
+                Direction::Down => download_worker(client, base, counter, chunk, deadline).await,
                 Direction::Up => upload_worker(client, &base, counter, deadline).await,
             }
         }));
@@ -481,30 +492,56 @@ async fn run_phase(
 
 async fn download_worker(
     client: reqwest::Client,
-    base_url: &str,
+    base_url: String,
     counter: Arc<AtomicU64>,
+    chunk: Arc<AtomicUsize>,
     deadline: Instant,
 ) {
-    const CHUNK: usize = 25_000_000;
-    let url = format!("{base_url}/__down?bytes={CHUNK}");
+    const MIN_CHUNK: usize = 100_000;
+    let max_chunk = chunk.load(Ordering::Relaxed);
+    let mut ok_streak = 0usize;
+
     while Instant::now() < deadline {
-        let Ok(resp) = client.get(&url).send().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let Ok(resp) = resp.error_for_status() else {
-            continue;
-        };
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    counter.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let n = chunk.load(Ordering::Relaxed);
+        let url = format!("{base_url}/__down?bytes={n}");
+
+        let mut ok = false;
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                ok = true;
+                let mut stream = resp.bytes_stream();
+                while let Some(part) = stream.next().await {
+                    match part {
+                        Ok(bytes) => {
+                            counter.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        }
+                        Err(_) => break,
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                 }
-                Err(_) => break,
             }
-            if Instant::now() >= deadline {
-                break;
+            _ => ok = false,
+        }
+
+        // Adapt the request size: shrink fast when refused, grow back slowly
+        // once the endpoint is willing again.
+        let current = chunk.load(Ordering::Relaxed);
+        if ok {
+            ok_streak += 1;
+            if ok_streak >= 8 {
+                ok_streak = 0;
+                if current < max_chunk {
+                    chunk.store((current + current / 2).min(max_chunk), Ordering::Relaxed);
+                }
+            }
+        } else {
+            ok_streak = 0;
+            if current > MIN_CHUNK {
+                chunk.store((current / 2).max(MIN_CHUNK), Ordering::Relaxed);
+            } else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
     }
