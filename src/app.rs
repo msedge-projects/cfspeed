@@ -146,7 +146,7 @@ impl App {
     pub fn on_event(&mut self, ev: Event) {
         match ev {
             Event::Meta(meta) => {
-                self.meta = meta;
+                self.meta = *meta;
             }
             Event::Phase(phase) => {
                 self.phase = phase;

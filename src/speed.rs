@@ -193,7 +193,9 @@ impl RunResult {
 
 #[derive(Debug)]
 pub enum Event {
-    Meta(Meta),
+    /// Boxed: a `Meta` is much larger than the other variants, and this enum
+    /// travels through a channel on every frame of a test.
+    Meta(Box<Meta>),
     Phase(Phase),
     /// One throughput sample, in Mbps.
     Tick {
@@ -419,7 +421,7 @@ impl Runner {
     async fn run_inner(&self, tx: &mpsc::UnboundedSender<Event>) -> Result<()> {
         let _ = tx.send(Event::Phase(Phase::Connecting));
         let meta = self.fetch_meta().await;
-        let _ = tx.send(Event::Meta(meta.clone()));
+        let _ = tx.send(Event::Meta(Box::new(meta.clone())));
 
         // --- Idle latency -------------------------------------------------
         let _ = tx.send(Event::Phase(Phase::Idle));
