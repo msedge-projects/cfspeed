@@ -32,7 +32,7 @@ impl Action {
             Action::ExportJson => "Export history as JSON",
             Action::ExportCsv => "Export history as CSV",
             Action::ClearHistory => "Clear history",
-            Action::ToggleChartEdge => "Chart edge: smooth",
+            Action::ToggleChartEdge => "Toggle smoothed trace",
         }
     }
 
@@ -42,7 +42,7 @@ impl Action {
             Action::ExportJson => "writes cfspeed-history.json",
             Action::ExportCsv => "writes cfspeed-history.csv",
             Action::ClearHistory => "removes every saved run",
-            Action::ToggleChartEdge => "braille edge, 4 steps per cell",
+            Action::ToggleChartEdge => "smoothing + 4 sub-rows per cell",
         }
     }
 
@@ -50,7 +50,7 @@ impl Action {
     /// offers the switch to the other style.
     pub fn edge_label(smooth: bool) -> &'static str {
         if smooth {
-            "Chart edge: solid"
+            "Chart edge: raw"
         } else {
             "Chart edge: smooth"
         }
@@ -228,7 +228,7 @@ impl App {
             error: None,
             restart: false,
             quit: false,
-            smooth_charts: false,
+            smooth_charts: true,
             generation: 0,
         }
     }
@@ -875,28 +875,39 @@ mod tests {
         assert_eq!(a.view, View::Charts, "a Release must not switch views");
     }
 
-    /// The edge style has to be switchable at runtime: smooth gives four steps
-    /// per cell but a dotted stroke, solid is fully dotless but coarser.
+    /// The edge style has to be switchable at runtime: smooth draws the trace
+    /// smoothed and four sub-rows deep but dotted, raw is dotless but coarser.
     #[test]
     fn the_edge_style_toggles_and_the_menu_offers_the_other_one() {
         let mut a = app();
-        assert!(!a.smooth_charts, "the solid line is the default");
+        let start = a.smooth_charts;
+        // The menu always names the style it would switch *to*.
         assert_eq!(
-            Action::edge_label(a.smooth_charts),
-            "Chart edge: smooth",
-            "the menu should offer the switch to smooth"
+            Action::edge_label(start),
+            if start {
+                "Chart edge: raw"
+            } else {
+                "Chart edge: smooth"
+            },
+            "the menu should offer the switch away from the current style"
         );
 
         a.run_action(Action::ToggleChartEdge);
-        assert!(a.smooth_charts);
+        assert_ne!(a.smooth_charts, start, "the toggle must flip the style");
         assert_eq!(
             Action::edge_label(a.smooth_charts),
-            "Chart edge: solid",
-            "the menu should offer the switch back to solid"
+            if start {
+                "Chart edge: smooth"
+            } else {
+                "Chart edge: raw"
+            }
         );
 
         a.run_action(Action::ToggleChartEdge);
-        assert!(!a.smooth_charts, "toggling twice returns to the default");
+        assert_eq!(
+            a.smooth_charts, start,
+            "toggling twice returns to the start"
+        );
         assert!(
             MENU.contains(&Action::ToggleChartEdge),
             "the toggle must be reachable from the palette"

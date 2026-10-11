@@ -62,6 +62,29 @@ pub fn braille_from_bits(bits: u8) -> char {
     char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
 }
 
+/// Centred moving average used to smooth the drawn trace.
+///
+/// The window is five samples, a second of trace at the engine's 200ms
+/// interval: enough for the eye to follow it as a curve, small enough that a
+/// real drop or spike still shows. Edges use a partial window so the first and
+/// last samples are not pulled toward zero.
+#[must_use]
+pub fn smooth_series(data: &[f64]) -> Vec<f64> {
+    const WINDOW: usize = 5;
+    if data.len() <= WINDOW {
+        return data.to_vec();
+    }
+    let half = WINDOW / 2;
+    data.iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let lo = i.saturating_sub(half);
+            let hi = (i + half + 1).min(data.len());
+            data[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 pub struct ChartStyle {
     /// Colour of the curve itself.
@@ -197,144 +220,113 @@ pub fn render_chart(
     let max = if max > 0.0 { max } else { 1.0 };
     let w = usize::from(plot.width);
     let h = usize::from(plot.height);
-    // Half blocks split a cell horizontally, giving the edge two steps per
-    // cell row. Braille splits it 2x4, so `smooth` takes the finer grid: four
-    // vertical steps and two horizontal ones per cell.
-    let sub_rows = if opts.smooth { 4 } else { 2 };
+    // Braille splits a cell 2x4, giving four vertical and two horizontal steps.
+    // Half blocks only split it horizontally, which is why the raw trace reads
+    // as a row of blocks rather than a curve.
+    let sub_rows = 4;
     let sub_h = h * sub_rows;
     let sub_w = w * 2;
 
+    // Smooth the trace before drawing it. Samples land 200ms apart and a real
+    // link is noisy, so the raw series is mostly high-frequency spikes that no
+    // amount of pixel resolution can turn into a wave. A web chart fits a curve
+    // through the points; this is the terminal equivalent. It affects the drawn
+    // line only - every statistic is still computed from the raw samples.
+    let series: Vec<f64> = if opts.smooth {
+        smooth_series(data)
+    } else {
+        data.to_vec()
+    };
+
     // Curve height per sub-column, in sub-rows from the top. `None` marks a
     // column before the first sample arrived.
-    //
-    // Values are interpolated between neighbouring samples so the edge glides
-    // across a cell instead of stepping once per column.
-    let first = data.len().saturating_sub(w);
+    let first = series.len().saturating_sub(w);
     let y_sub: Vec<Option<f64>> = (0..sub_w)
         .map(|c| {
             let pos = first as f64 + c as f64 / 2.0;
             let i0 = pos.floor() as usize;
-            if i0 >= data.len() {
+            if i0 >= series.len() {
                 return None;
             }
             let frac = pos - i0 as f64;
-            let a = data[i0];
-            let b = data.get(i0 + 1).copied().unwrap_or(a);
+            let a = series[i0];
+            let b = series.get(i0 + 1).copied().unwrap_or(a);
             let norm = ((a + (b - a) * frac) / max).clamp(0.0, 1.0);
             Some((1.0 - norm) * (sub_h - 1) as f64)
         })
         .collect();
 
-    // Smooth mode takes the higher of the two sub-columns, so the solid body
-    // still reaches the drawn wave. Solid mode samples the cell centre instead,
-    // which stops one sharp sample becoming a full-height spike.
-    let y_cell: Vec<Option<usize>> = (0..w)
-        .map(|cx| match (y_sub[cx * 2], y_sub[cx * 2 + 1]) {
-            (Some(a), Some(b)) => Some(if opts.smooth { a.min(b) } else { (a + b) / 2.0 }),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
-        })
-        .map(|o| o.map(|v| (v.round().max(0.0) as usize).min(sub_h - 1)))
-        .collect();
-
-    // Smooth mode draws the wave itself as a braille stroke, giving the edge
-    // four steps per cell vertically and two horizontally. Only the stroke is
-    // dots - the body underneath is still painted solid.
     let grid_style = Style::default().fg(style.axis);
     let grid_row = plot.height / 2;
 
-    // Grid first; the solid body paints over it wherever the chart reaches.
+    // Grid first; the fill paints over it wherever the chart reaches.
     for cx in 0..w {
         let pos = Position::new(plot.x + cx as u16, plot.y + grid_row);
         if let Some(cell) = buf.cell_mut(pos) {
-            cell.set_symbol("·");
+            cell.set_symbol("\u{b7}");
             cell.set_style(grid_style);
         }
     }
 
-    for (cx, slot) in y_cell.iter().enumerate() {
-        let Some(y) = *slot else { continue };
-        let cell_x = plot.x + cx as u16;
-        // First row the body reaches in this column. The fill fades from here
-        // down to the baseline, so the area reads as lit by the curve rather
-        // than as a slab dropped in from the top.
-        let crest_row = y.div_ceil(sub_rows);
-        // Only smooth mode can legitimately fill nothing: at the baseline there
-        // is no area under the curve at all. Solid mode still draws its crest
-        // there, which is what keeps a trace that touches zero continuous.
-        if opts.smooth && crest_row >= h {
+    // Trace the curve. Each sub-column gets a dot, and consecutive sub-columns
+    // are joined vertically: without that a curve that moves more than one
+    // sub-row between columns breaks into detached specks instead of a line.
+    let mut line_bits = vec![0u8; w * h];
+    // Topmost row the curve reaches in each column, so the fill starts there
+    // instead of leaving the stroke hanging over empty space.
+    let mut col_top = vec![h; w];
+    //
+    // The stroke is two sub-rows deep, which is an even line rather than a
+    // dotted one. Bridging between sub-columns was tried here and made it worse:
+    // a steep segment joins as a vertical run of dots, and those runs are what
+    // made the curve look like scattered specks. With the trace smoothed, a
+    // half-cell line leaves only occasional small gaps and reads cleanly.
+    for (c, slot) in y_sub.iter().enumerate() {
+        let Some(v) = *slot else { continue };
+        let y = (v.round().max(0.0) as usize).min(sub_h - 1);
+        let ccx = c / 2;
+        for yy in y..=(y + 1).min(sub_h - 1) {
+            let ccy = yy / sub_rows;
+            if ccx < w && ccy < h {
+                line_bits[ccy * w + ccx] |= dot_bit(c % 2, yy % sub_rows);
+                col_top[ccx] = col_top[ccx].min(ccy);
+            }
+        }
+    }
+
+    for cx in 0..w {
+        let top = col_top[cx];
+        if top >= h {
             continue;
         }
-        for cy in 0..h {
-            let cell_top = cy * sub_rows;
-            if opts.smooth {
-                if cy < crest_row {
-                    continue;
-                }
-            } else if y > cell_top + sub_rows - 1 {
-                // Wholly above the curve: leave the grid and background alone.
-                continue;
-            }
+        let cell_x = plot.x + cx as u16;
+        for cy in top..h {
             let pos = Position::new(cell_x, plot.y + cy as u16);
             let Some(cell) = buf.cell_mut(pos) else {
                 continue;
             };
-            // A background fill covers its whole cell, so the body's top edge is
-            // quantised to the cell and can never be as fine as the stroke. A
-            // heavy fill makes that stair-step the dominant thing on screen and
-            // the curve stops reading as a curve. Keeping the tint light lets
-            // the eye follow the stroke instead, which is the part that is
-            // drawn at full resolution.
-            // The fill is an area gradient: barely there where it meets the
-            // line, saturating toward the baseline. Running the ramp the other
-            // way - heaviest at the crest - makes the chart read as a solid
-            // slab with a pale foot, which is the opposite of how a web chart
-            // is shaded and looks like a bar chart rather than an area.
-            // saturating: in solid mode a crest cell whose curve lands on an odd
-            // sub-row sits above crest_row, since that cell is drawn as the
-            // lower half-block rather than counted as fill.
-            let depth = cy.saturating_sub(crest_row) as f64;
-            let span = h.saturating_sub(crest_row).max(1) as f64;
-            let k = 0.05 + 0.50 * (depth / span);
-            // Quantise the ramp. A per-row gradient spans the full range in as
-            // many steps as there are rows, and each one lands as a hard edge,
-            // which reads as stripes rather than as depth.
+            // Area gradient: faint where it meets the line, saturating toward
+            // the baseline. Running the ramp the other way - heaviest at the
+            // crest - reads as a slab with a pale foot rather than an area.
+            let depth = (cy - top) as f64;
+            let span = h.saturating_sub(top).max(1) as f64;
+            // Start bright enough that the fill visibly meets the line: a top
+            // step of near-zero reads as a gap under the curve.
+            let k = 0.16 + 0.42 * (depth / span);
+            // Quantise: a per-row ramp spans the full range in as many steps as
+            // there are rows, and each step lands as a hard edge, which reads
+            // as stripes rather than depth.
             const FILL_STEPS: f64 = 6.0;
             let k = (k * FILL_STEPS).round() / FILL_STEPS;
             let body = theme::blend(theme::SURFACE, style.fill, k);
 
-            if opts.smooth && cy > crest_row {
-                // Below the crest cell the area is solid background. Only the
-                // single cell the wave passes through is drawn with dots, so
-                // the edge can land on any of four sub-rows instead of stepping
-                // once per cell. Extending the dots downward as well would
-                // turn the whole body into a field of them again.
+            let bits = line_bits[cy * w + cx];
+            if bits == 0 {
                 cell.set_symbol(" ");
                 cell.set_style(Style::default().bg(body));
-            } else if opts.smooth {
-                let mut bits = 0u8;
-                for sy in 0..sub_rows {
-                    if cell_top + sy > y {
-                        bits |= dot_bit(0, sy) | dot_bit(1, sy);
-                    }
-                }
-                cell.set_symbol(braille_from_bits(bits).encode_utf8(&mut [0u8; 4]));
-                cell.set_style(Style::default().fg(body));
-            } else if y == cell_top + 1 {
-                // The curve sits in this cell's lower half, so the crest fills
-                // it and the upper half keeps the background.
-                cell.set_symbol("▄");
-                cell.set_style(Style::default().fg(style.line));
-            } else if y == cell_top {
-                // The curve crosses the upper half: crest on top, body beneath.
-                cell.set_symbol("▀");
-                cell.set_style(Style::default().fg(style.line).bg(body));
             } else {
-                // Wholly below the curve. A bare background paints the cell
-                // solid with no glyph at all - giving it a half-block here
-                // would stripe the body with a bright line on every row.
-                cell.set_symbol(" ");
-                cell.set_style(Style::default().bg(body));
+                cell.set_symbol(braille_from_bits(bits).encode_utf8(&mut [0u8; 4]));
+                cell.set_style(Style::default().fg(style.line).bg(body));
             }
         }
     }
@@ -728,5 +720,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The drawn trace is smoothed; the reported numbers are not. Averaging must
+    /// preserve the series length and its overall level, or the curve would sit
+    /// at a different height from the headline figure beside it.
+    #[test]
+    fn smoothing_preserves_length_and_level() {
+        let data: Vec<f64> = (0..20).map(|i| 100.0 + (i % 5) as f64 * 10.0).collect();
+        let s = smooth_series(&data);
+        assert_eq!(s.len(), data.len(), "length must be preserved");
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        assert!(
+            (mean(&s) - mean(&data)).abs() < 1.0,
+            "smoothing shifted the level: {} vs {}",
+            mean(&s),
+            mean(&data)
+        );
+    }
+
+    /// Smoothing must actually flatten noise, which is the whole point of it.
+    #[test]
+    fn smoothing_reduces_sample_to_sample_jitter() {
+        let spikes: Vec<f64> = (0..30)
+            .map(|i| if i % 2 == 0 { 100.0 } else { 180.0 })
+            .collect();
+        let jitter = |v: &[f64]| v.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>();
+        assert!(
+            jitter(&smooth_series(&spikes)) < jitter(&spikes) * 0.5,
+            "smoothing did not reduce jitter"
+        );
+        // Too short to smooth: passed through untouched.
+        assert_eq!(smooth_series(&[1.0, 9.0]), vec![1.0, 9.0]);
     }
 }
