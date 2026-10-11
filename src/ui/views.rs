@@ -217,7 +217,7 @@ fn nav_bar(frame: &mut Frame, area: Rect, app: &mut App) {
 
     for v in View::ALL {
         let label = v.label();
-        let w = usize::from(label.len()) + 2;
+        let w = label.len() + 2;
         spans.push(pill(label, v == app.view, ACCENT_LAT));
         app.nav.push((
             v,
