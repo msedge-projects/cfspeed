@@ -470,10 +470,10 @@ mod tests {
         let data: Vec<f64> = (0..40).map(|i| i as f64 * 2.5).collect();
         let b = plot(40, 8, &data, 100.0);
         // Record which row the topmost ink sits in, per column.
-        let top: Vec<i32> = (0..40)
+        let top: Vec<i32> = (0..40u16)
             .map(|x| {
-                (0..8)
-                    .find(|y| is_dot(&sym(&b, x as u16, *y as u16)))
+                (0..8u16)
+                    .find(|y| is_dot(&sym(&b, x, *y)))
                     .map(i32::from)
                     .unwrap_or(-1)
             })
