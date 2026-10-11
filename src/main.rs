@@ -23,7 +23,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use app::App;
-use speed::{Config, Event, Runner};
+use speed::{Config, Event, Runner, TestMode};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -66,7 +66,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 async fn event_loop(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
-    start_run(&tx);
+    start_run(&tx, app.mode);
 
     app.begin_run();
 
@@ -109,7 +109,7 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
             break;
         }
         if app.restart {
-            start_run(&tx);
+            start_run(&tx, app.mode);
             app.begin_run();
         }
     }
@@ -118,10 +118,14 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
 }
 
 /// Spawn a measurement run. The engine streams [`Event`]s back over `tx`.
-fn start_run(tx: &mpsc::UnboundedSender<Event>) {
+fn start_run(tx: &mpsc::UnboundedSender<Event>, mode: TestMode) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        match Runner::new(Config::default()) {
+        let config = Config {
+            mode,
+            ..Config::default()
+        };
+        match Runner::new(config) {
             Ok(runner) => runner.run(tx).await,
             Err(e) => {
                 let _ = tx.send(Event::Failed(format!("could not start: {e}")));

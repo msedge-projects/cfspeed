@@ -57,6 +57,94 @@ pub fn save(runs: &[RunResult]) -> Result<()> {
     fs::write(history_path(), payload).context("writing history file")
 }
 
+/// Write every saved run to `cfspeed-history.json` in the working directory.
+pub fn export_json(runs: &[RunResult]) -> Result<PathBuf> {
+    let path = std::env::current_dir()?.join("cfspeed-history.json");
+    let payload = serde_json::to_string_pretty(runs)?;
+    fs::write(&path, payload).context("writing JSON export")?;
+    Ok(path)
+}
+
+/// Write every saved run to `cfspeed-history.csv` in the working directory.
+pub fn export_csv(runs: &[RunResult]) -> Result<PathBuf> {
+    let path = std::env::current_dir()?.join("cfspeed-history.csv");
+
+    let header = [
+        "timestamp_utc",
+        "colo",
+        "ip",
+        "download_avg_mbps",
+        "upload_avg_mbps",
+        "download_p95_mbps",
+        "upload_p95_mbps",
+        "download_bytes",
+        "upload_bytes",
+        "idle_median_ms",
+        "loaded_download_median_ms",
+        "jitter_ms",
+        "loss_pct",
+        "bufferbloat_ms",
+        "stability_cv_pct",
+    ];
+
+    let mut out = String::new();
+    out.push_str(&header.join(","));
+    out.push('\n');
+
+    for r in runs {
+        let dl_cv = cv(&r.download.samples);
+        let ul_cv = cv(&r.upload.samples);
+        let row = [
+            r.timestamp_ms.to_string(),
+            csv_field(&r.meta.colo),
+            csv_field(&r.meta.ip),
+            f2(r.download.avg),
+            f2(r.upload.avg),
+            f2(r.download.p95),
+            f2(r.upload.p95),
+            r.download.bytes.to_string(),
+            r.upload.bytes.to_string(),
+            f2(r.idle.med),
+            f2(r.loaded_down.med),
+            f2(r.idle.jitter),
+            f2(r.idle.loss),
+            f2(r.bufferbloat_ms()),
+            f2(dl_cv.max(ul_cv)),
+        ];
+        out.push_str(&row.join(","));
+        out.push('\n');
+    }
+
+    fs::write(&path, out).context("writing CSV export")?;
+    Ok(path)
+}
+
+fn cv(samples: &[f64]) -> f64 {
+    crate::speed::cv_percent(samples)
+}
+
+fn f2(v: f64) -> String {
+    format!("{v:.2}")
+}
+
+/// Quote a value if it contains a comma, quote or newline.
+fn csv_field(v: &str) -> String {
+    if v.contains([',', '"', '\n']) {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_string()
+    }
+}
+
+/// Delete the saved history file and return its path.
+pub fn clear() -> Result<PathBuf> {
+    let path = history_path();
+    if path.exists() {
+        fs::remove_file(&path).context("removing history file")?;
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

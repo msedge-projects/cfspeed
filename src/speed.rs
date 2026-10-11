@@ -217,6 +217,41 @@ pub enum Event {
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Which phases a run should exercise.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TestMode {
+    /// Latency, then download, then upload.
+    Full,
+    /// Idle latency only - a "ping" equivalent.
+    Latency,
+    /// Latency then download.
+    Download,
+    /// Latency then upload.
+    Upload,
+}
+
+impl TestMode {
+    #[must_use]
+    pub fn runs_download(self) -> bool {
+        matches!(self, Self::Full | Self::Download)
+    }
+
+    #[must_use]
+    pub fn runs_upload(self) -> bool {
+        matches!(self, Self::Full | Self::Upload)
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "FULL",
+            Self::Latency => "LATENCY",
+            Self::Download => "DOWNLOAD",
+            Self::Upload => "UPLOAD",
+        }
+    }
+}
+
 pub struct Config {
     pub base_url: String,
     pub idle_duration: Duration,
@@ -227,6 +262,7 @@ pub struct Config {
     /// Preferred bytes per download request. Cloudflare rate-limits large
     /// payloads (HTTP 429), so the workers start here and adapt downwards.
     pub download_chunk: usize,
+    pub mode: TestMode,
 }
 
 impl Default for Config {
@@ -239,6 +275,7 @@ impl Default for Config {
             concurrency: 6,
             sample_interval: Duration::from_millis(200),
             download_chunk: 1_000_000,
+            mode: TestMode::Full,
         }
     }
 }
@@ -462,34 +499,46 @@ impl Runner {
         }
         let idle = summarise_latency(&idle_samples);
 
-        let (download, loaded_down) = run_phase(
-            PhaseSpec {
-                client: &self.client,
-                base_url: &self.config.base_url,
-                concurrency: self.config.concurrency,
-                duration: self.config.download_duration,
-                sample_interval: self.config.sample_interval,
-                phase: Phase::Download,
-                dir: Direction::Down,
-                download_chunk: self.config.download_chunk,
-            },
-            tx,
-        )
-        .await?;
-        let (upload, loaded_up) = run_phase(
-            PhaseSpec {
-                client: &self.client,
-                base_url: &self.config.base_url,
-                concurrency: self.config.concurrency,
-                duration: self.config.upload_duration,
-                sample_interval: self.config.sample_interval,
-                phase: Phase::Upload,
-                dir: Direction::Up,
-                download_chunk: self.config.download_chunk,
-            },
-            tx,
-        )
-        .await?;
+        // Skip phases the selected mode does not exercise. A latency-only run still
+        // completes, with empty throughput rather than short-circuiting.
+
+        let (download, loaded_down) = if self.config.mode.runs_download() {
+            run_phase(
+                PhaseSpec {
+                    client: &self.client,
+                    base_url: &self.config.base_url,
+                    concurrency: self.config.concurrency,
+                    duration: self.config.download_duration,
+                    sample_interval: self.config.sample_interval,
+                    phase: Phase::Download,
+                    dir: Direction::Down,
+                    download_chunk: self.config.download_chunk,
+                },
+                tx,
+            )
+            .await?
+        } else {
+            (ThroughputStats::default(), LatencyStats::default())
+        };
+
+        let (upload, loaded_up) = if self.config.mode.runs_upload() {
+            run_phase(
+                PhaseSpec {
+                    client: &self.client,
+                    base_url: &self.config.base_url,
+                    concurrency: self.config.concurrency,
+                    duration: self.config.upload_duration,
+                    sample_interval: self.config.sample_interval,
+                    phase: Phase::Upload,
+                    dir: Direction::Up,
+                    download_chunk: self.config.download_chunk,
+                },
+                tx,
+            )
+            .await?
+        } else {
+            (ThroughputStats::default(), LatencyStats::default())
+        };
 
         let _ = tx.send(Event::Phase(Phase::Finalising));
         let result = RunResult {
@@ -690,48 +739,37 @@ async fn upload_worker(
 ) {
     use bytes::Bytes;
     use rand::RngCore;
-    use std::sync::atomic::AtomicUsize;
 
-    // Each request sends a *finite* body: `send()` resolves on response headers,
-    // so an endless stream would be abandoned mid-flight and restarted,
-    // crediting bytes the server never received.
+    // Count bytes only once the server has acknowledged a complete body.
     //
-    // The body is still streamed in chunks rather than handed over as one
-    // blob, so the byte counter advances at roughly socket pace and the
-    // sampled curve stays smooth instead of stepping by 25MB per request.
-    const CHUNK: usize = 250 * 1024;
-    const CHUNKS: usize = 100; // 25MB per request
+    // An earlier version streamed an endless body and counted as reqwest pulled
+    // chunks from it. That measures bytes handed to the kernel, not bytes
+    // delivered: the counter runs ahead of the wire by whatever is sitting in
+    // the socket buffer, which produced momentary readings of well over 1 Gbps
+    // on a link that actually sustains ~130 Mbps. A fixed body that is counted
+    // only on a 2xx response is ground truth, and bodies are kept small so
+    // completions stay frequent enough for a smooth sampled curve.
+    const BODY: usize = 1024 * 1024;
 
-    let payload: Bytes = {
-        let mut v = vec![0u8; CHUNK];
-        rand::thread_rng().fill_bytes(&mut v);
-        // `Bytes::from(Vec)` takes ownership without copying; cloning per
-        // chunk is just a refcount bump.
-        Bytes::from(v)
-    };
-    let chunk_len = payload.len() as u64;
+    let mut buf = vec![0u8; BODY];
+    rand::thread_rng().fill_bytes(&mut buf);
+    // `Bytes::from(Vec)` takes ownership without copying; cloning per request
+    // is a refcount bump.
+    let payload = Bytes::from(buf);
+    let body_len = payload.len() as u64;
     let url = format!("{base_url}/__up");
 
     while Instant::now() < deadline {
-        let remaining = Arc::new(AtomicUsize::new(CHUNKS));
-        let shared = payload.clone();
-        let shared_counter = Arc::clone(&counter);
-        let stream = futures::stream::unfold((), move |()| {
-            let payload = shared.clone();
-            let counter = Arc::clone(&shared_counter);
-            let remaining = Arc::clone(&remaining);
-            async move {
-                if remaining.fetch_sub(1, Ordering::SeqCst) == 0 {
-                    return None;
-                }
-                counter.fetch_add(chunk_len, Ordering::Relaxed);
-                Some((Ok::<Bytes, std::io::Error>(payload), ()))
+        match client.post(&url).body(payload.clone()).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                counter.fetch_add(body_len, Ordering::Relaxed);
             }
-        });
-        let body = reqwest::Body::wrap_stream(stream);
-        if let Err(e) = client.post(&url).body(body).send().await {
-            let _ = e;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
 }

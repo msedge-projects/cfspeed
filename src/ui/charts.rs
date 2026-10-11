@@ -251,14 +251,13 @@ pub fn render_chart(
                     // The stroke stays bright so the edge reads as a curve.
                     Style::default().fg(style.line).add_modifier(Modifier::BOLD)
                 } else {
-                    // Body darkens toward the baseline so the bright stroke
-                    // above it reads as the curve rather than the fill.
-                    let depth = 1.0 - (cy as f64 / h.max(1) as f64);
-                    Style::default().fg(theme::blend(
-                        theme::SURFACE,
-                        style.fill,
-                        0.18 + depth * 0.30,
-                    ))
+                    // The body carries most of the colour so the chart reads as
+                    // a filled shape rather than an outline. It deepens toward
+                    // the crest and fades slightly into the baseline, which
+                    // anchors the curve and keeps the stroke legible on top.
+                    let t = cy as f64 / h.max(1) as f64;
+                    let ramp = 0.42 + (1.0 - t) * 0.38;
+                    Style::default().fg(theme::blend(theme::SURFACE, style.fill, ramp))
                 };
                 cell.set_style(st);
             } else if cy == usize::from(grid_row) && opts.y_axis {
@@ -325,7 +324,12 @@ fn write_at(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
     }
 }
 
-/// Horizontal meter with a bright leading cap.
+/// Horizontal meter that fades along its length, matching the graded body of
+/// the charts above it.
+///
+/// Without the fade a progress bar reads as a flat slab of colour; the same
+/// surface -> accent ramp that fills a chart makes the bar feel lit from the
+/// left and keeps it consistent with the rest of the panel.
 #[must_use]
 pub fn meter(fraction: f64, width: u16, fill: Color, track: Color) -> Text<'static> {
     let width = usize::from(width);
@@ -335,23 +339,52 @@ pub fn meter(fraction: f64, width: u16, fill: Color, track: Color) -> Text<'stat
     let filled = ((fraction.clamp(0.0, 1.0)) * width as f64).round() as usize;
     let filled = filled.min(width);
 
-    let fill_style = Style::default().fg(fill);
-    let cap_style = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-    let track_style = Style::default().fg(track);
+    // Quantise the ramp so adjacent cells share a span instead of allocating
+    // one per character.
+    const STEPS: usize = 12;
+    let step_style = |step: usize| {
+        let t = step as f64 / (STEPS - 1) as f64;
+        Style::default().fg(theme::blend(track, fill, 0.25 + t * 0.75))
+    };
 
-    let mut spans = Vec::new();
-    let body = filled.saturating_sub(1);
-    if body > 0 {
-        spans.push(Span::styled("█".repeat(body), fill_style));
-    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
     if filled > 0 {
-        spans.push(Span::styled("█", cap_style));
+        let mut run_start = 0usize;
+        let mut run_step = 0usize;
+        for i in 0..filled {
+            let t = if filled > 1 {
+                i as f64 / (filled - 1) as f64
+            } else {
+                1.0
+            };
+            let step = (t * (STEPS - 1) as f64).round() as usize;
+            if step != run_step {
+                spans.push(Span::styled(
+                    "█".repeat(i - run_start),
+                    step_style(run_step),
+                ));
+                run_start = i;
+                run_step = step;
+            }
+        }
+        spans.push(Span::styled(
+            "█".repeat(filled - run_start),
+            step_style(run_step),
+        ));
+        // Bright cap marks the leading edge, the same idea as the chart crest.
+        let last = spans
+            .last_mut()
+            .expect("filled > 0 guarantees at least one span");
+        *last = Span::styled(
+            last.content.to_string(),
+            Style::default().fg(fill).add_modifier(Modifier::BOLD),
+        );
     }
-    let rest = width - filled;
-    if rest > 0 {
-        spans.push(Span::styled("─".repeat(rest), track_style));
+    if filled < width {
+        spans.push(Span::styled(
+            "─".repeat(width - filled),
+            Style::default().fg(track),
+        ));
     }
     Text::from(Line::from(spans))
 }

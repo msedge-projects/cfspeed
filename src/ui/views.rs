@@ -4,13 +4,13 @@
 //! from whitespace, thin rules and colour weight, so the interface reads as one
 //! continuous surface rather than a set of framed panels.
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, View};
+use crate::app::{App, View, MENU, QUICK_ACTIONS};
 use crate::speed::{
     bufferbloat_grade, cv_percent, median, percentile, stability_grade, LatencyStats, Phase,
 };
@@ -70,6 +70,91 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     stat_tiles(frame, rows[6], app);
     rule(frame, rows[7]);
     nav_bar(frame, rows[8], app);
+
+    if app.menu_open {
+        command_palette(frame, area, app);
+    }
+}
+
+/// Command palette: every action in the app, reachable from one key, without
+/// adding permanent chrome to the layout.
+fn command_palette(frame: &mut Frame, area: Rect, app: &App) {
+    let w = 56.min(area.width.saturating_sub(4));
+    let h = (MENU.len() as u16 + 4).min(area.height.saturating_sub(2));
+    if w < 24 || h < 6 {
+        return;
+    }
+    let box_area = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + 2,
+        width: w,
+        height: h,
+    };
+
+    let border_style = Style::default().fg(ACCENT_LAT);
+    let right = box_area.right();
+
+    // Top and bottom rails.
+    for (y, left_glyph, right_glyph) in [
+        (box_area.y, '╭', '╮'),
+        (box_area.y + box_area.height - 1, '╰', '╯'),
+    ] {
+        for x in box_area.x..right {
+            let glyph = if x == box_area.x {
+                left_glyph
+            } else if x + 1 == right {
+                right_glyph
+            } else {
+                '─'
+            };
+            if let Some(c) = frame.buffer_mut().cell_mut(Position::new(x, y)) {
+                c.set_symbol(glyph.encode_utf8(&mut [0u8; 4]));
+                c.set_style(border_style);
+            }
+        }
+    }
+
+    // Side rails.
+    for y in box_area.y + 1..box_area.y + box_area.height - 1 {
+        for x in [box_area.x, right - 1] {
+            if let Some(c) = frame.buffer_mut().cell_mut(Position::new(x, y)) {
+                c.set_symbol("│");
+                c.set_style(border_style);
+            }
+        }
+    }
+
+    let inner = Rect {
+        x: box_area.x + 2,
+        y: box_area.y + 1,
+        width: box_area.width.saturating_sub(4),
+        height: box_area.height.saturating_sub(2),
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" Actions", theme::style_title()),
+        Span::styled("   ↑↓ select   ⏎ run   esc close", theme::style_label()),
+    ])];
+    for (i, action) in MENU.iter().enumerate() {
+        let selected = i == app.menu_sel;
+        let style = if selected {
+            Style::default()
+                .fg(theme::TEXT_BRIGHT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+        let mut row = vec![Span::styled(format!(" {}  ", i + 1), theme::style_label())];
+        if selected {
+            row.push(Span::styled("▸ ", Style::default().fg(ACCENT_LAT)));
+        } else {
+            row.push(Span::raw("  "));
+        }
+        row.push(Span::styled(format!("{:<26}", action.label()), style));
+        row.push(Span::styled(action.hint(), theme::style_label()));
+        lines.push(Line::from(row));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,22 +320,42 @@ fn nav_bar(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let pause_word = if app.paused { "resume" } else { "pause" };
     let zoom_label = app.zoom.label();
+    let mode_label = app.mode.label();
     let mut keys = vec![
         Span::raw("space "),
         Span::styled(pause_word, theme::style_label()),
-        Span::raw("   +/- zoom ("),
+        Span::raw("  +/- zoom ("),
         Span::styled(zoom_label, theme::style_label()),
-        Span::raw(")   r run   Shift+H hide   q quit"),
+        Span::raw(")  m actions  "),
     ];
+    // Quick test modes stay visible so they never need to be memorised.
+    for (key, action, _) in QUICK_ACTIONS {
+        keys.push(Span::styled(
+            format!("{key} "),
+            Style::default().fg(theme::TEXT_BRIGHT),
+        ));
+        keys.push(Span::styled(
+            format!("{}  ", action.label().rsplit(' ').next().unwrap_or("")),
+            theme::style_label(),
+        ));
+    }
+    keys.push(Span::raw("r rerun  q quit"));
     if app.paused {
         keys.insert(0, badge("PAUSED", theme::TEXT_BRIGHT));
         keys.insert(1, Span::raw(" "));
     }
+    let _ = mode_label;
     if let Some(e) = &app.error {
         keys = vec![Span::styled(
             format!("error: {e}"),
             Style::default().fg(theme::grade_color("F")),
         )];
+    }
+    if !app.status.is_empty() {
+        keys.push(Span::styled(
+            format!("  {}", app.status),
+            theme::style_label(),
+        ));
     }
     frame.render_widget(
         Paragraph::new(Line::from(keys)).alignment(Alignment::Right),

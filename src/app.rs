@@ -8,8 +8,49 @@ use ratatui::layout::Rect;
 use crate::history;
 use crate::speed::{
     bufferbloat_grade, cv_percent, stability_grade, Event, LatencyStats, Meta, Phase, RunResult,
+    TestMode,
 };
 use crate::ui::charts::Scaler;
+
+/// A command-palette entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    Run(TestMode),
+    ExportJson,
+    ExportCsv,
+    ClearHistory,
+}
+
+impl Action {
+    pub fn label(self) -> &'static str {
+        match self {
+            Action::Run(TestMode::Full) => "Run full test",
+            Action::Run(TestMode::Latency) => "Latency only  (ping)",
+            Action::Run(TestMode::Download) => "Download only",
+            Action::Run(TestMode::Upload) => "Upload only",
+            Action::ExportJson => "Export history as JSON",
+            Action::ExportCsv => "Export history as CSV",
+            Action::ClearHistory => "Clear history",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Action::Run(m) => m.label(),
+            Action::ExportJson => "writes cfspeed-history.json",
+            Action::ExportCsv => "writes cfspeed-history.csv",
+            Action::ClearHistory => "removes every saved run",
+        }
+    }
+}
+
+/// Quick-access keys, shown in the footer so they need no menu.
+pub const QUICK_ACTIONS: [(char, Action, &str); 4] = [
+    ('f', Action::Run(TestMode::Full), "full"),
+    ('p', Action::Run(TestMode::Latency), "ping"),
+    ('d', Action::Run(TestMode::Download), "down"),
+    ('u', Action::Run(TestMode::Upload), "up"),
+];
 
 /// Bound on retained samples so a long session cannot grow without limit.
 const MAX_POINTS: usize = 1200;
@@ -80,10 +121,23 @@ impl Default for Zoom {
     }
 }
 
+/// Static list of palette entries, so the menu never has to be rebuilt.
+pub const MENU: [Action; 7] = [
+    Action::Run(TestMode::Full),
+    Action::Run(TestMode::Latency),
+    Action::Run(TestMode::Download),
+    Action::Run(TestMode::Upload),
+    Action::ExportJson,
+    Action::ExportCsv,
+    Action::ClearHistory,
+];
+
 pub struct App {
     pub view: View,
     pub phase: Phase,
     pub meta: Meta,
+    /// Which phases the current run will exercise.
+    pub mode: TestMode,
 
     pub idle: LatencyStats,
     pub down_samples: Vec<f64>,
@@ -113,6 +167,11 @@ pub struct App {
     pub paused: bool,
     pub zoom: Zoom,
 
+    /// Command palette state. The menu is an overlay, so extra actions cost
+    /// nothing until they are summoned.
+    pub menu_open: bool,
+    pub menu_sel: usize,
+
     pub status: String,
     pub error: Option<String>,
     pub restart: bool,
@@ -125,6 +184,7 @@ impl App {
             view: View::Live,
             phase: Phase::Connecting,
             meta: Meta::default(),
+            mode: TestMode::Full,
             idle: LatencyStats::default(),
             down_samples: Vec::new(),
             up_samples: Vec::new(),
@@ -141,6 +201,8 @@ impl App {
             hide_info: false,
             paused: false,
             zoom: Zoom::default(),
+            menu_open: false,
+            menu_sel: 0,
             nav: Vec::new(),
             status: String::new(),
             error: None,
@@ -245,8 +307,55 @@ impl App {
             return;
         }
 
+        // While the palette is open it owns the keyboard.
+        if self.menu_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.menu_open = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.menu_sel = self.menu_sel.saturating_sub(1).min(MENU.len() - 1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.menu_sel = (self.menu_sel + 1).min(MENU.len() - 1)
+                }
+                KeyCode::Home => self.menu_sel = 0,
+                KeyCode::End => self.menu_sel = MENU.len() - 1,
+                KeyCode::Enter => {
+                    let action = MENU[self.menu_sel];
+                    self.menu_open = false;
+                    self.run_action(action);
+                }
+                // 1-9 jump straight to an entry, as a command palette should.
+                KeyCode::Char(c) => {
+                    if let Some(i) = c.to_digit(10).map(|d| d as usize - 1) {
+                        if i < MENU.len() {
+                            self.menu_sel = i;
+                            let action = MENU[i];
+                            self.menu_open = false;
+                            self.run_action(action);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Quick-access test modes.
+        if let Some((_, action, _)) = QUICK_ACTIONS
+            .iter()
+            .find(|(k, _, _)| key.code == KeyCode::Char(*k))
+        {
+            self.run_action(*action);
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+
+            KeyCode::Char('m') | KeyCode::Char('/') => {
+                self.menu_open = true;
+                self.menu_sel = 0;
+            }
 
             KeyCode::Char('r') => {
                 if !self.running {
@@ -288,6 +397,40 @@ impl App {
     pub fn window<'a>(&self, samples: &'a [f64]) -> &'a [f64] {
         let n = self.zoom.0.min(samples.len());
         &samples[samples.len() - n..]
+    }
+
+    /// Perform a palette or quick-key action.
+    pub fn run_action(&mut self, action: Action) {
+        match action {
+            Action::Run(mode) => {
+                self.mode = mode;
+                self.status = format!("running {} test", mode.label());
+                // Re-run immediately; the engine reads `mode` when it starts.
+                self.restart = true;
+            }
+            Action::ExportJson => match history::export_json(&self.history) {
+                Ok(path) => {
+                    self.status =
+                        format!("exported {} runs to {}", self.history.len(), path.display())
+                }
+                Err(e) => self.status = format!("export failed: {e}"),
+            },
+            Action::ExportCsv => match history::export_csv(&self.history) {
+                Ok(path) => {
+                    self.status =
+                        format!("exported {} runs to {}", self.history.len(), path.display())
+                }
+                Err(e) => self.status = format!("export failed: {e}"),
+            },
+            Action::ClearHistory => match history::clear() {
+                Ok(_) => {
+                    self.history.clear();
+                    self.history_sel = 0;
+                    self.status = "history cleared".to_string();
+                }
+                Err(e) => self.status = format!("could not clear history: {e}"),
+            },
+        }
     }
 
     /// Resolve a mouse click to a nav tab.
@@ -519,11 +662,95 @@ mod tests {
         assert_eq!(a.view, View::History);
     }
 
+    #[test]
+    fn m_opens_the_palette_and_escape_closes_it() {
+        let mut a = app();
+        a.on_key(press('m'));
+        assert!(a.menu_open);
+        a.on_key(press_key(KeyCode::Esc));
+        assert!(!a.menu_open);
+    }
+
+    #[test]
+    fn palette_swallows_keys_it_does_not_handle() {
+        let mut a = app();
+        a.view = View::Live;
+        a.on_key(press('m'));
+        // An unbound character must not reach the normal bindings...
+        a.on_key(press('x'));
+        assert!(a.menu_open, "palette stays open");
+        // ...and neither must the privacy toggle, which would otherwise
+        // redact the screen out from under the open palette.
+        a.on_key(press('H'));
+        assert!(!a.hide_info, "palette must capture Shift+H");
+        assert!(a.menu_open);
+    }
+
+    #[test]
+    fn palette_navigation_wraps_within_bounds() {
+        let mut a = app();
+        a.on_key(press('m'));
+        a.on_key(press_key(KeyCode::Home));
+        a.on_key(press_key(KeyCode::Up));
+        assert_eq!(a.menu_sel, 0, "must not underflow");
+        a.on_key(press_key(KeyCode::End));
+        a.on_key(press_key(KeyCode::Down));
+        assert_eq!(a.menu_sel, MENU.len() - 1, "must not overflow");
+    }
+
+    #[test]
+    fn enter_runs_the_selected_action() {
+        let mut a = app();
+        a.on_key(press('m'));
+        // Row 3 is "Download only".
+        a.on_key(press('3'));
+        assert_eq!(a.mode, TestMode::Download);
+        assert!(a.restart, "choosing a test must start it");
+        assert!(!a.menu_open, "palette closes after running");
+    }
+
+    #[test]
+    fn quick_keys_select_test_modes() {
+        let mut a = app();
+        a.on_key(press('d'));
+        assert_eq!(a.mode, TestMode::Download);
+        a.on_key(press('u'));
+        assert_eq!(a.mode, TestMode::Upload);
+        a.on_key(press('p'));
+        assert_eq!(a.mode, TestMode::Latency);
+        a.on_key(press('f'));
+        assert_eq!(a.mode, TestMode::Full);
+    }
+
+    #[test]
+    fn every_menu_entry_has_a_label_and_hint() {
+        for a in MENU {
+            assert!(!a.label().is_empty());
+            assert!(!a.hint().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_modes_gate_the_phases() {
+        assert!(TestMode::Full.runs_download() && TestMode::Full.runs_upload());
+        assert!(!TestMode::Latency.runs_download());
+        assert!(!TestMode::Latency.runs_upload());
+        assert!(TestMode::Download.runs_download());
+        assert!(!TestMode::Download.runs_upload());
+        assert!(!TestMode::Upload.runs_download());
+        assert!(TestMode::Upload.runs_upload());
+    }
+
     fn press(c: char) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(c),
             crossterm::event::KeyModifiers::NONE,
         )
+    }
+
+    /// Build a non-character key press (arrows, Home/End, Enter).
+    fn press_key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
 
     #[test]
