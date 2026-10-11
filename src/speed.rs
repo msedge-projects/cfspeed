@@ -685,15 +685,33 @@ async fn run_phase(
         h.abort();
     }
 
+    let total_bytes = counter.load(Ordering::Relaxed);
+
+    // A phase that moved no bytes did not measure a slow link, it was refused.
+    //
+    // The workers treat any non-2xx response as a reason to back off rather
+    // than an error, which is the right behaviour mid-phase but hides a
+    // total refusal. Cloudflare rate-limits by payload size and answers 429
+    // under sustained testing; without this check the run would report a
+    // confident "0 Mbps" measurement, which is a fabricated result rather
+    // than an honest failure.
+    if total_bytes == 0 && !cancelled(cancel) {
+        anyhow::bail!(
+            "{} transferred no data - Cloudflare refused every request.\n\
+             This is rate limiting caused by repeated testing, not a speed \
+             result. Wait a few minutes before running again.",
+            match dir {
+                Direction::Down => "Download",
+                Direction::Up => "Upload",
+            }
+        );
+    }
+
     // Drop the ramp-up (TCP slow start) before summarising.
     let ramp = ((samples.len() as f64 * 0.2) as usize)
         .max(1)
         .min(samples.len());
-    let stats = summarise_throughput(
-        &samples[ramp..],
-        counter.load(Ordering::Relaxed),
-        duration.as_millis() as u64,
-    );
+    let stats = summarise_throughput(&samples[ramp..], total_bytes, duration.as_millis() as u64);
     let lat = summarise_latency(&probe_samples);
     Ok((stats, lat))
 }
@@ -944,5 +962,117 @@ mod tests {
         assert_eq!(s.bytes, 999, "bytes are counted even without samples");
         assert_eq!(s.samples.len(), 0);
         assert_eq!(s.avg, 0.0);
+    }
+
+    /// Cloudflare answers 429 under sustained testing. The workers back off
+    /// rather than error, which is correct mid-phase but means a run where
+    /// every single request is refused used to finish as a tidy "0 Mbps"
+    /// measurement. That is a fabricated result: the link was never measured.
+    #[tokio::test]
+    async fn a_fully_refused_phase_fails_instead_of_reporting_zero_speed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\n\
+                              Content-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let config = Config {
+            base_url: format!("http://{addr}"),
+            idle_duration: Duration::from_millis(50),
+            download_duration: Duration::from_millis(500),
+            upload_duration: Duration::from_millis(500),
+            concurrency: 2,
+            sample_interval: Duration::from_millis(100),
+            download_chunk: 1_000,
+            mode: TestMode::Download,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner = Runner::new(config).unwrap();
+        runner.run(tx, Arc::new(AtomicBool::new(false))).await;
+
+        let mut failed = None;
+        let mut finished = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Event::Failed(e) => failed = Some(e),
+                Event::Finished(_) => finished = true,
+                _ => {}
+            }
+        }
+
+        assert!(!finished, "a fully refused run must not publish a result");
+        let err = failed.expect("a fully refused run must report an error");
+        assert!(err.contains("refused"), "unhelpful message: {err}");
+    }
+
+    /// The mirror case: a phase that moved bytes must still complete, so the
+    /// refusal guard cannot fire on a genuinely slow link.
+    #[tokio::test]
+    async fn a_slow_but_working_phase_still_completes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = vec![b'x'; 4_096];
+        let body = payload.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                });
+            }
+        });
+
+        let config = Config {
+            base_url: format!("http://{addr}"),
+            idle_duration: Duration::from_millis(50),
+            download_duration: Duration::from_millis(500),
+            upload_duration: Duration::from_millis(500),
+            concurrency: 2,
+            sample_interval: Duration::from_millis(100),
+            download_chunk: 1_000,
+            mode: TestMode::Download,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner = Runner::new(config).unwrap();
+        runner.run(tx, Arc::new(AtomicBool::new(false))).await;
+
+        let mut failed = None;
+        let mut finished = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Event::Failed(e) => failed = Some(e),
+                Event::Finished(_) => finished = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(failed, None, "a working phase must not error");
+        assert!(finished, "a working phase must still publish a result");
     }
 }

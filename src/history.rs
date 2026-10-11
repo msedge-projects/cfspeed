@@ -57,18 +57,33 @@ pub fn save(runs: &[RunResult]) -> Result<()> {
     fs::write(history_path(), payload).context("writing history file")
 }
 
-/// Write every saved run to `cfspeed-history.json` in the working directory.
-pub fn export_json(runs: &[RunResult]) -> Result<PathBuf> {
-    let path = std::env::current_dir()?.join("cfspeed-history.json");
-    let payload = serde_json::to_string_pretty(runs)?;
-    fs::write(&path, payload).context("writing JSON export")?;
+/// Write an export, preferring the working directory so the file lands where
+/// the user is looking, but falling back to the data directory when that is
+/// not writable. Running `cfspeed` from a read-only location (a Program Files
+/// install, a locked share) would otherwise fail with nothing to show.
+fn write_export(name: &str, body: &str) -> Result<PathBuf> {
+    if let Ok(cwd) = std::env::current_dir() {
+        let path = cwd.join(name);
+        if fs::write(&path, body).is_ok() {
+            return Ok(path);
+        }
+    }
+
+    let dir = data_dir();
+    fs::create_dir_all(&dir).context("creating export directory")?;
+    let path = dir.join(name);
+    fs::write(&path, body).with_context(|| format!("writing {name}"))?;
     Ok(path)
 }
 
-/// Write every saved run to `cfspeed-history.csv` in the working directory.
-pub fn export_csv(runs: &[RunResult]) -> Result<PathBuf> {
-    let path = std::env::current_dir()?.join("cfspeed-history.csv");
+/// Write every saved run to `cfspeed-history.json`.
+pub fn export_json(runs: &[RunResult]) -> Result<PathBuf> {
+    let payload = serde_json::to_string_pretty(runs)?;
+    write_export("cfspeed-history.json", &payload)
+}
 
+/// Write every saved run to `cfspeed-history.csv`.
+pub fn export_csv(runs: &[RunResult]) -> Result<PathBuf> {
     let header = [
         "timestamp_utc",
         "colo",
@@ -115,8 +130,7 @@ pub fn export_csv(runs: &[RunResult]) -> Result<PathBuf> {
         out.push('\n');
     }
 
-    fs::write(&path, out).context("writing CSV export")?;
-    Ok(path)
+    write_export("cfspeed-history.csv", &out)
 }
 
 fn cv(samples: &[f64]) -> f64 {
