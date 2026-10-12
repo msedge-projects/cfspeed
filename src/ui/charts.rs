@@ -213,7 +213,7 @@ pub fn render_chart(
             let st = if cy == top {
                 Style::default().fg(style.line).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::blend(theme::SURFACE_ALT, style.fill, 0.72))
+                Style::default().fg(theme::shade(style.fill, 0.72))
             };
             cell.set_style(st);
         }

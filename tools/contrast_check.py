@@ -22,13 +22,13 @@ def contrast(a, b):
 
 # Tokyo Night, as shipped in btop's themes/tokyo-night.theme
 SURFACE = "#1a1b26"
-SURFACE_ALT = "#292e42"
+SURFACE_ALT = "#303032"
 
 PALETTE = {
     "TEXT": "#a9b1d6",
     "TEXT_BRIGHT": "#c0caf5",
     "TEXT_DIM": "#9399b5",
-    "BORDER": "#3b4261",
+    "BORDER": "#404040",
     "ACCENT_DOWN": "#9ece6a",
     "ACCENT_UP": "#e0af68",
     "ACCENT_LAT": "#7dcfff",
