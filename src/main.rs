@@ -92,6 +92,12 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
     // it writes, but building every Paragraph and Span still happens every
     // time, so skipping the draw is where the saving is.
     let mut dirty = true;
+    // Set once the input stream ends. Selecting on a finished stream makes
+    // `next()` return `None` instantly and forever, which turns the loop into a
+    // tight spin at full CPU. A terminal whose event reader hiccups once would
+    // otherwise peg a core for as long as the app stays open.
+    let mut input_done = false;
+    let mut last_size: Option<(u16, u16)> = None;
 
     loop {
         if dirty {
@@ -110,7 +116,7 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
                 app.on_event(gen, ev);
                 dirty = true;
             }
-            maybe = events.next() => {
+            maybe = events.next(), if !input_done => {
                 match maybe {
                     Some(Ok(CEvent::Key(key))) if key.kind == KeyEventKind::Press => {
                         app.on_key(key);
@@ -123,11 +129,18 @@ async fn event_loop(terminal: &mut Tui) -> Result<()> {
                             dirty = true;
                         }
                     }
-                    Some(Ok(CEvent::Resize(_, _))) => {
-                        // Ratatui redraws at full size on the next frame.
-                        dirty = true;
+                    Some(Ok(CEvent::Resize(w, h))) => {
+                        // Terminals emit these in bursts - on focus changes and
+                        // tab switches - and each one costs a full repaint.
+                        // Only a genuine size change is worth redrawing for.
+                        if last_size != Some((w, h)) {
+                            last_size = Some((w, h));
+                            dirty = true;
+                        }
                     }
-                    Some(Err(_)) | None => {}
+                    Some(Err(_)) | None => {
+                        input_done = true;
+                    }
                     _ => {}
                 }
             }
