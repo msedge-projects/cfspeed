@@ -18,6 +18,10 @@ FONT_SIZE = 16
 PAD = 8
 
 capture, out_path = sys.argv[1], sys.argv[2]
+# Optional third argument: composite over this colour instead of leaving the
+# background transparent, so the chart can be checked against a light terminal
+# theme as well as a dark one.
+over = sys.argv[3] if len(sys.argv) > 3 else None
 
 # xterm 16-colour palette, tuned to match a typical dark terminal.
 BASE = {
@@ -136,7 +140,10 @@ while pos < len(data):
 
 W = COLS * CELL_W + PAD * 2
 H = ROWS * CELL_H + PAD * 2
-img = Image.new("RGB", (W, H), DEFAULT_BG)
+# Transparent unless a colour was given. The app paints no background of its
+# own, so anything opaque here would be the renderer lying about it.
+base = tuple(int(over[i : i + 2], 16) for i in (1, 3, 5)) if over else None
+img = Image.new("RGBA", (W, H), (base + (255,)) if base else (0, 0, 0, 0))
 d = ImageDraw.Draw(img)
 font = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", FONT_SIZE)
 
@@ -145,10 +152,11 @@ for y in range(ROWS):
         px, py = PAD + x * CELL_W, PAD + y * CELL_H
         b = bg[y][x]
         if b is not None:
-            d.rectangle([px, py, px + CELL_W - 1, py + CELL_H - 1], fill=b)
+            d.rectangle([px, py, px + CELL_W - 1, py + CELL_H - 1], fill=b + (255,))
         ch = sym[y][x]
         if ch != " ":
             d.text((px, py), ch, font=font, fill=cur_fg if False else (fg[y][x] or DEFAULT_FG))
 
 img.save(out_path)
-print(f"{out_path}: {W}x{H}, {sum(1 for y in range(ROWS) for x in range(COLS) if bg[y][x])} painted cells")
+painted = sum(1 for y in range(ROWS) for x in range(COLS) if bg[y][x])
+print(f"{out_path}: {W}x{H}, {painted} background-painted cells")

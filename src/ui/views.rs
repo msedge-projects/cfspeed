@@ -1639,4 +1639,39 @@ mod tests {
         let b = column_of(row_you + 1).expect("rule on the edge row");
         assert_eq!(a, b, "both sides must start at the same column");
     }
+
+    /// The app must not paint a background of its own, so the terminal's own
+    /// theme - including a translucent or image-backed one - shows through. The
+    /// only background it is allowed to set is the selected nav tab's pill.
+    #[test]
+    fn the_main_view_paints_no_background() {
+        let mut app = App::new();
+        app.view = View::Live;
+        app.down_samples = (0..40).map(|i| (i % 20) as f64 * 6.0).collect();
+        app.meta.ip = "59.182.148.163".into();
+        app.meta.colo = "MAA".into();
+        let backend = ratatui::backend::TestBackend::new(120, 34);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+
+        // The phase badge in the header and the selected tab in the footer are
+        // deliberate highlights. Everything between them - the route strip, the
+        // charts, the stat tiles - must leave the terminal background alone.
+        let reset = ratatui::style::Color::Reset;
+        let mut painted: Vec<(u16, u16)> = Vec::new();
+        for y in 2..buf.area.height.saturating_sub(4) {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].bg != reset {
+                    painted.push((x, y));
+                }
+            }
+        }
+        assert!(
+            painted.is_empty(),
+            "the content area is painting a background on {} cells, e.g. {:?}",
+            painted.len(),
+            &painted[..painted.len().min(5)]
+        );
+    }
 }
