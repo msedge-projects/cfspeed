@@ -27,7 +27,6 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
 
 use crate::ui::theme;
 
@@ -272,71 +271,6 @@ fn write_at(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
             cell.set_style(style);
         }
     }
-}
-
-/// Horizontal meter that fades along its length, matching the graded body of
-/// the charts above it.
-///
-/// Without the fade a progress bar reads as a flat slab of colour; the same
-/// surface -> accent ramp that fills a chart makes the bar feel lit from the
-/// left and keeps it consistent with the rest of the panel.
-#[must_use]
-pub fn meter(fraction: f64, width: u16, fill: Color, track: Color) -> Text<'static> {
-    let width = usize::from(width);
-    if width == 0 {
-        return Text::default();
-    }
-    let filled = ((fraction.clamp(0.0, 1.0)) * width as f64).round() as usize;
-    let filled = filled.min(width);
-
-    // Quantise the ramp so adjacent cells share a span instead of allocating
-    // one per character.
-    const STEPS: usize = 12;
-    let step_style = |step: usize| {
-        let t = step as f64 / (STEPS - 1) as f64;
-        Style::default().fg(theme::blend(track, fill, 0.25 + t * 0.75))
-    };
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    if filled > 0 {
-        let mut run_start = 0usize;
-        let mut run_step = 0usize;
-        for i in 0..filled {
-            let t = if filled > 1 {
-                i as f64 / (filled - 1) as f64
-            } else {
-                1.0
-            };
-            let step = (t * (STEPS - 1) as f64).round() as usize;
-            if step != run_step {
-                spans.push(Span::styled(
-                    "█".repeat(i - run_start),
-                    step_style(run_step),
-                ));
-                run_start = i;
-                run_step = step;
-            }
-        }
-        spans.push(Span::styled(
-            "█".repeat(filled - run_start),
-            step_style(run_step),
-        ));
-        // Bright cap marks the leading edge, the same idea as the chart crest.
-        let last = spans
-            .last_mut()
-            .expect("filled > 0 guarantees at least one span");
-        *last = Span::styled(
-            last.content.to_string(),
-            Style::default().fg(fill).add_modifier(Modifier::BOLD),
-        );
-    }
-    if filled < width {
-        spans.push(Span::styled(
-            "─".repeat(width - filled),
-            Style::default().fg(track),
-        ));
-    }
-    Text::from(Line::from(spans))
 }
 
 /// Format a rate with a sensible unit.

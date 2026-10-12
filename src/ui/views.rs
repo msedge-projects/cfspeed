@@ -14,7 +14,7 @@ use crate::app::{App, View, MENU, QUICK_ACTIONS};
 use crate::speed::{
     bufferbloat_grade, cv_percent, median, percentile, stability_grade, LatencyStats, Phase,
 };
-use crate::ui::charts::{format_mbps, meter, render_chart, ChartOpts, ChartStyle};
+use crate::ui::charts::{format_mbps, render_chart, ChartOpts, ChartStyle};
 use crate::ui::theme::{self, ACCENT_DOWN, ACCENT_LAT, ACCENT_UP};
 use crate::ui::widgets::{badge, pill};
 
@@ -232,13 +232,6 @@ fn route(frame: &mut Frame, area: Rect, app: &App) {
             })
             .partition(|a| !a.contains(':'))
     };
-    let port = m
-        .edge_ips
-        .first()
-        .and_then(|a| a.rsplit(':').next())
-        .filter(|p| p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()))
-        .map(|p| format!(":{p}"))
-        .unwrap_or_default();
 
     // --- Row 1: you, rule, edge -----------------------------------------
     let mut line: Vec<Span<'static>> = Vec::new();
@@ -286,7 +279,7 @@ fn route(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(ROUTE_EDGE).add_modifier(Modifier::BOLD),
     ));
     line.push(Span::styled(
-        pad(&format!("{node}{port}"), EDGE_COLS + 2),
+        pad(&node, EDGE_COLS + 2),
         Style::default().fg(theme::TEXT_BRIGHT),
     ));
     if !v4.is_empty() {
@@ -305,29 +298,6 @@ fn route(frame: &mut Frame, area: Rect, app: &App) {
         line2.push(Span::styled(
             v6.join("  "),
             Style::default().fg(theme::TEXT),
-        ));
-    }
-    let mut bits: Vec<String> = Vec::new();
-    if !app.hide_info {
-        if !m.tls.is_empty() {
-            let mut t = m.tls.clone();
-            if !m.tls_cipher.is_empty() {
-                t.push(' ');
-                t.push_str(&m.tls_cipher);
-            }
-            bits.push(t);
-        }
-        if !m.http.is_empty() {
-            bits.push(m.http.clone());
-        }
-        if !m.warp.is_empty() && m.warp != "off" {
-            bits.push(format!("WARP {}", m.warp));
-        }
-    }
-    if !bits.is_empty() {
-        line2.push(Span::styled(
-            format!("   {}", bits.join(" \u{00b7} ")),
-            Style::default().fg(theme::TEXT_DIM),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(line2)), rows[1]);
@@ -626,8 +596,7 @@ fn phase_column(
         .constraints([
             Constraint::Length(1), // label
             Constraint::Length(1), // headline
-            Constraint::Length(1), // meter
-            Constraint::Min(1),    // chart
+            Constraint::Min(2),    // chart - a row taller without the meter
             Constraint::Length(1), // summary
         ])
         .split(area);
@@ -669,25 +638,10 @@ fn phase_column(
         rows[1],
     );
 
-    // 3. Meter showing the phase average against the scale.
-    let (avg, _, _) = sample_stats(samples);
-    if let Some(line) = meter(
-        avg / scale_max.max(1.0),
-        area.width.saturating_sub(2),
-        color,
-        theme::SURFACE_ALT,
-    )
-    .lines
-    .into_iter()
-    .next()
-    {
-        frame.render_widget(Paragraph::new(line), rows[2]);
-    }
-
-    // 4. Chart with labelled axes.
+    // 3. Chart with labelled axes.
     render_chart(
         frame.buffer_mut(),
-        rows[3],
+        rows[2],
         samples,
         scale_max,
         ChartStyle {
@@ -703,8 +657,8 @@ fn phase_column(
         },
     );
 
-    // 5. Summary.
-    let (_, p95, peak) = sample_stats(samples);
+    // Summary.
+    let (avg, p95, peak) = sample_stats(samples);
     let mut summary = vec![
         Span::styled(" avg ", theme::style_label()),
         Span::styled(format_mbps(avg), Style::default().fg(theme::TEXT)),
@@ -719,7 +673,7 @@ fn phase_column(
             Style::default().fg(theme::grade_color("D")),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(summary)), rows[4]);
+    frame.render_widget(Paragraph::new(Line::from(summary)), rows[3]);
 }
 
 // ---------------------------------------------------------------------------

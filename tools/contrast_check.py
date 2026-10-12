@@ -22,7 +22,6 @@ def contrast(a, b):
 
 # Tokyo Night, as shipped in btop's themes/tokyo-night.theme
 SURFACE = "#1a1b26"
-SURFACE_ALT = "#303032"
 
 PALETTE = {
     "TEXT": "#a9b1d6",
@@ -37,12 +36,12 @@ PALETTE = {
     "GRADE_F": "#f7768e",
 }
 
-print(f"surface {SURFACE} / alt {SURFACE_ALT}\n")
+print(f"surface {SURFACE}\n")
 print(f"{'token':<16}{'hex':<10}{'vs surface':>12}{'vs alt':>10}  verdict")
 print("-" * 62)
 for name, hexv in PALETTE.items():
     c1 = contrast(hexv, SURFACE)
-    c2 = contrast(hexv, SURFACE_ALT)
+    c2 = c1
     # Body text needs 4.5:1; large text and borders only 3:1.
     floor = 3.0 if "BORDER" in name else 4.5
     ok = "PASS" if min(c1, c2) >= floor else "FAIL"

@@ -29,14 +29,6 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
 /// Card background: a hair above the terminal background so panels read as
 /// raised surfaces.
 pub const SURFACE: Color = rgb(26, 27, 38);
-/// Slightly brighter neutral grey for nested elements and meter tracks.
-///
-/// Deliberately desaturated. These two surfaces were Tokyo Night's own, which
-/// carry a blue cast tuned to sit on bg `#1a1b26`; on a terminal whose
-/// background is pure black that cast became visible as blue rules and blue-
-/// tinged bars floating on the background.
-pub const SURFACE_ALT: Color = rgb(48, 48, 50);
-/// Hairline borders. Decorative only - never used for text.
 pub const BORDER: Color = rgb(64, 64, 64);
 
 // --- Accents ---------------------------------------------------------------
@@ -145,7 +137,6 @@ mod tests {
             _ => panic!("palette must use explicit RGB so it is theme-independent"),
         };
         assert_eq!(to_hex(SURFACE), (26, 27, 38));
-        assert_eq!(to_hex(SURFACE_ALT), (48, 48, 50));
         assert_eq!(to_hex(BORDER), (64, 64, 64));
         assert_eq!(to_hex(TEXT), (169, 177, 214));
         assert_eq!(to_hex(TEXT_BRIGHT), (192, 202, 245));
