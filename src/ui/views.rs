@@ -201,21 +201,62 @@ fn route(frame: &mut Frame, area: Rect, app: &App) {
 
     let m = &app.meta;
 
-    // --- Row 1: YOU -------------------------------------------------------
-    let mut you: Vec<Span<'static>> = vec![Span::styled(
-        "  YOU   ",
-        Style::default().fg(ROUTE_SELF).add_modifier(Modifier::BOLD),
-    )];
+    // Two fixed columns with a rule between them, so the two sides line up on
+    // the same grid every run instead of trailing off at whatever the addresses
+    // happen to be.
+    const YOU_COLS: usize = 52;
+    const EDGE_COLS: usize = 6; // "EDGE  "
+
+    let rule = Span::styled("\u{2502}", Style::default().fg(theme::BORDER));
+
+    let node = if !m.colo.is_empty() {
+        m.colo.clone()
+    } else if !m.loc.is_empty() {
+        m.loc.clone()
+    } else {
+        "\u{2026}".to_string()
+    };
+
+    // Ports are the same for every address; printing them four times is noise,
+    // so they are stated once on the node.
+    let (v4, v6): (Vec<String>, Vec<String>) = if app.hide_info {
+        (Vec::new(), Vec::new())
+    } else {
+        m.edge_ips
+            .iter()
+            .map(|a| {
+                a.split(':')
+                    .filter(|p| !p.is_empty() && *p != "443")
+                    .collect::<Vec<_>>()
+                    .join(":")
+            })
+            .partition(|a| !a.contains(':'))
+    };
+    let port = m
+        .edge_ips
+        .first()
+        .and_then(|a| a.rsplit(':').next())
+        .filter(|p| p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()))
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+
+    // --- Row 1: you, rule, edge -----------------------------------------
+    let mut line: Vec<Span<'static>> = Vec::new();
     if app.hide_info {
-        you.push(Span::styled(
-            "hidden   press Shift+H to reveal",
+        line.push(Span::styled(
+            "  YOU   ".to_string(),
+            Style::default().fg(ROUTE_SELF).add_modifier(Modifier::BOLD),
+        ));
+        line.push(Span::styled(
+            pad("hidden \u{00b7} Shift+H reveals", YOU_COLS - 8),
             Style::default().fg(theme::TEXT_DIM),
         ));
     } else {
-        you.push(Span::styled(
-            if m.ip.is_empty() { "…" } else { &m.ip }.to_string(),
-            Style::default().fg(theme::TEXT_BRIGHT),
-        ));
+        let ip = if m.ip.is_empty() {
+            "\u{2026}"
+        } else {
+            m.ip.as_str()
+        };
         let mut who: Vec<String> = Vec::new();
         if !m.asn_org.is_empty() {
             who.push(m.asn_org.clone());
@@ -226,38 +267,55 @@ fn route(frame: &mut Frame, area: Rect, app: &App) {
         if !m.loc.is_empty() {
             who.push(m.loc.clone());
         }
-        if !who.is_empty() {
-            you.push(Span::styled(
-                format!("   {}", who.join(" · ")),
-                Style::default().fg(theme::TEXT),
-            ));
-        }
+        line.push(Span::styled(
+            "  YOU   ".to_string(),
+            Style::default().fg(ROUTE_SELF).add_modifier(Modifier::BOLD),
+        ));
+        line.push(Span::styled(
+            format!("{ip:20}"),
+            Style::default().fg(theme::TEXT_BRIGHT),
+        ));
+        line.push(Span::styled(
+            pad(&who.join(" \u{00b7} "), YOU_COLS - 28),
+            Style::default().fg(theme::TEXT),
+        ));
     }
-    frame.render_widget(Paragraph::new(Line::from(you)), rows[0]);
-
-    // --- Row 2: EDGE ------------------------------------------------------
-    let mut edge: Vec<Span<'static>> = vec![Span::styled(
-        "  EDGE  ",
+    line.push(rule.clone());
+    line.push(Span::styled(
+        " EDGE  ".to_string(),
         Style::default().fg(ROUTE_EDGE).add_modifier(Modifier::BOLD),
-    )];
-    let node = if !m.colo.is_empty() {
-        m.colo.clone()
-    } else if !m.loc.is_empty() {
-        m.loc.clone()
-    } else {
-        "…".to_string()
-    };
-    edge.push(Span::styled(node, Style::default().fg(theme::TEXT_BRIGHT)));
+    ));
+    line.push(Span::styled(
+        pad(&format!("{node}{port}"), EDGE_COLS + 2),
+        Style::default().fg(theme::TEXT_BRIGHT),
+    ));
+    if !v4.is_empty() {
+        line.push(Span::styled(
+            v4.join("  "),
+            Style::default().fg(theme::TEXT),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(line)), rows[0]);
+
+    // --- Row 2: the edge's other addresses, under the first ---------------
+    let mut line2: Vec<Span<'static>> = vec![Span::raw(pad("", YOU_COLS))];
+    line2.push(rule);
+    line2.push(Span::raw(pad("", EDGE_COLS + 2)));
+    if !v6.is_empty() {
+        line2.push(Span::styled(
+            v6.join("  "),
+            Style::default().fg(theme::TEXT),
+        ));
+    }
+    let mut bits: Vec<String> = Vec::new();
     if !app.hide_info {
-        if !m.edge_ips.is_empty() {
-            edge.push(Span::styled(
-                format!("   {}", m.edge_ips.join("  ")),
-                Style::default().fg(theme::TEXT),
-            ));
-        }
-        let mut bits: Vec<String> = Vec::new();
         if !m.tls.is_empty() {
-            bits.push(format!("{} {}", m.tls, m.tls_cipher).trim().to_string());
+            let mut t = m.tls.clone();
+            if !m.tls_cipher.is_empty() {
+                t.push(' ');
+                t.push_str(&m.tls_cipher);
+            }
+            bits.push(t);
         }
         if !m.http.is_empty() {
             bits.push(m.http.clone());
@@ -265,14 +323,24 @@ fn route(frame: &mut Frame, area: Rect, app: &App) {
         if !m.warp.is_empty() && m.warp != "off" {
             bits.push(format!("WARP {}", m.warp));
         }
-        if !bits.is_empty() {
-            edge.push(Span::styled(
-                format!("   {}", bits.join(" · ")),
-                Style::default().fg(theme::TEXT_DIM),
-            ));
-        }
     }
-    frame.render_widget(Paragraph::new(Line::from(edge)), rows[1]);
+    if !bits.is_empty() {
+        line2.push(Span::styled(
+            format!("   {}", bits.join(" \u{00b7} ")),
+            Style::default().fg(theme::TEXT_DIM),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(line2)), rows[1]);
+}
+
+/// Pad or clip to an exact width so columns stay on the grid.
+fn pad(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n >= w {
+        s.chars().take(w).collect()
+    } else {
+        format!("{s}{}", " ".repeat(w - n))
+    }
 }
 
 fn target_line(app: &App) -> String {
@@ -367,17 +435,52 @@ fn nav_bar(frame: &mut Frame, area: Rect, app: &mut App) {
 // Stat tiles
 // ---------------------------------------------------------------------------
 
+/// Grade for a packet-loss percentage. Anything above a tenth of a percent is
+/// already visible on a call.
+fn loss_grade(loss: f64) -> &'static str {
+    match loss {
+        ..=0.0 => "A+",
+        ..=0.5 => "A",
+        ..=1.0 => "B",
+        ..=2.0 => "C",
+        ..=5.0 => "D",
+        _ => "F",
+    }
+}
+
+/// Smallest positive sample, ignoring probes that recorded nothing. Returns 0
+/// when there is no usable sample at all.
+fn min_of(samples: &[f64]) -> f64 {
+    let min = samples
+        .iter()
+        .copied()
+        .filter(|v| *v > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    if min.is_finite() {
+        min
+    } else {
+        0.0
+    }
+}
+
 fn stat_tiles(frame: &mut Frame, area: Rect, app: &App) {
     let measuring = app.phase == Phase::Idle || app.running;
-    let (idle, loaded, jitter, loss) = match &app.result {
-        Some(r) => (r.idle.med, r.loaded_down.med, r.idle.jitter, r.idle.loss),
+    let (idle, loaded, jitter, loss, best) = match &app.result {
+        Some(r) => (
+            r.idle.med,
+            r.loaded_down.med,
+            r.idle.jitter,
+            r.idle.loss,
+            r.idle.min,
+        ),
         None if measuring => (
             median(&app.probe_samples),
             0.0,
             jit(&app.probe_samples),
             0.0,
+            min_of(&app.probe_samples),
         ),
-        None => (0.0, 0.0, 0.0, 0.0),
+        None => (0.0, 0.0, 0.0, 0.0, 0.0),
     };
 
     let mut tiles: Vec<(&str, String, Color)> = Vec::new();
@@ -390,8 +493,17 @@ fn stat_tiles(frame: &mut Frame, area: Rect, app: &App) {
     if jitter > 0.0 {
         tiles.push(("JITTER", fmt_ms(jitter), ACCENT_LAT));
     }
-    if loss > 0.0 {
-        tiles.push(("LOSS", format!("{loss:.1}%"), theme::grade_color("D")));
+    // Loss is shown even at zero. Hiding it when there is none makes a clean
+    // link indistinguishable from a test that never probed anything.
+    if measuring || app.result.is_some() {
+        tiles.push((
+            "LOSS",
+            format!("{loss:.1}%"),
+            theme::grade_color(loss_grade(loss)),
+        ));
+    }
+    if best > 0.0 {
+        tiles.push(("MIN", fmt_ms(best), ACCENT_LAT));
     }
     if let Some(q) = app.quality() {
         tiles.push((
@@ -1461,5 +1573,70 @@ mod tests {
             !text.contains("-240s"),
             "axis must not claim 240s of history that was never measured"
         );
+    }
+
+    /// Loss used to be gated on `loss > 0`, so a clean link showed nothing at
+    /// all - the one result where the figure matters most was the one that
+    /// never appeared.
+    #[test]
+    fn packet_loss_is_shown_even_when_zero() {
+        let mut app = App::new();
+        app.view = View::Live;
+        app.running = false;
+        let mut run = crate::speed::RunResult::default();
+        run.idle.med = 52.0;
+        run.idle.min = 47.0;
+        run.idle.jitter = 11.0;
+        run.idle.loss = 0.0;
+        run.loaded_down.med = 114.0;
+        app.result = Some(run);
+
+        let backend = ratatui::backend::TestBackend::new(120, 34);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("LOSS"), "loss tile missing:\n{text}");
+        assert!(text.contains("0.0%"), "zero loss must be shown as a figure");
+        assert!(text.contains("MIN"), "best-case latency should be shown");
+    }
+
+    /// The two sides of the route strip share one grid, so the rule that
+    /// separates them lands on the same column on both rows.
+    #[test]
+    fn route_strip_puts_both_sides_on_one_grid() {
+        let mut app = App::new();
+        app.view = View::Live;
+        app.meta.ip = "59.182.148.163".into();
+        app.meta.colo = "MAA".into();
+        app.meta.edge_ips = vec!["162.159.140.220:443".into(), "[2606:4700:7::da]:443".into()];
+        app.meta.tls = "TLSv1.3".into();
+
+        let backend = ratatui::backend::TestBackend::new(120, 34);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+
+        let column_of = |y: u16| -> Option<usize> {
+            (0..buf.area.width)
+                .find(|x| buf[(*x, y)].symbol() == "\u{2502}")
+                .map(usize::from)
+        };
+        let row_text =
+            |y: u16| -> String { (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect() };
+        let row_you = (0..buf.area.height)
+            .find(|y| row_text(*y).contains("YOU"))
+            .expect("route row");
+        // The second route row is the one below it.
+        let a = column_of(row_you).expect("rule on the you row");
+        let b = column_of(row_you + 1).expect("rule on the edge row");
+        assert_eq!(a, b, "both sides must start at the same column");
     }
 }
